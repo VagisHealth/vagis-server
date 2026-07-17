@@ -1,5 +1,5 @@
 """
-Vagis backend — agent relay server.
+Vagis backend — agent relay server + metric ingestion.
 
 This is the always-on server that sits between the Vagis app and Claude.
 The app never calls Anthropic directly and never holds the API key. Instead:
@@ -17,17 +17,30 @@ Why this exists:
     it currently computes; the server formats them generically. Add a metric or a
     mode in the app and the agent reflects it automatically, with no server change.
 
-This same server is the backend the dashboard push/ingest endpoints will later be
-added to. For now it does one job: relay the personal agent chat.
+This same server is also the ingestion backend for the research portal. The app
+uploads cumulative CSV metric files (Sleep, Stand, Rest, Breathwork, ...) tagged
+with the subject's enrollment code; the server stores them in Postgres so they
+survive redeploys and can later be read by the portal.
+
+    Vagis app  ->  POST /ingest (enrollment_code, mode, CSV)  ->  Postgres
+
+Endpoints:
+    GET  /health        -- server status
+    POST /chat          -- personal agent relay
+    POST /ingest        -- upload a cumulative CSV for one enrollment code + mode
+    GET  /ingest/list   -- list what's been uploaded (verification / portal read)
 """
 
 from __future__ import annotations
 
+import csv
+import io
 import os
 from typing import Any
 
 import anthropic
-from fastapi import FastAPI, Header, HTTPException
+import psycopg2
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 # --------------------------------------------------------------------------
@@ -45,9 +58,85 @@ VAGIS_APP_TOKEN = os.environ.get("VAGIS_APP_TOKEN", "")
 MODEL = os.environ.get("VAGIS_MODEL", "claude-sonnet-4-6")
 MAX_TOKENS = int(os.environ.get("VAGIS_MAX_TOKENS", "1024"))
 
+# Postgres connection string. On Render this is the Internal Database URL of
+# vagis-db, set as the DATABASE_URL environment variable on this service.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+# Reject absurdly large uploads. Cumulative metric CSVs are tiny (a few KB);
+# 10 MB is a generous ceiling that still blocks abuse.
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 app = FastAPI(title="Vagis Agent Server")
+
+
+# --------------------------------------------------------------------------
+# Database helpers
+# --------------------------------------------------------------------------
+# One row per (enrollment_code, mode). Uploads are cumulative masters, so a new
+# upload for the same code + mode REPLACES the previous one (upsert). csv_text
+# holds the whole file verbatim -- ingestion stays schema-agnostic, so each mode
+# can have completely different columns and nothing here needs to change.
+CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS metric_uploads (
+    id              SERIAL PRIMARY KEY,
+    enrollment_code TEXT        NOT NULL,
+    mode            TEXT        NOT NULL,
+    filename        TEXT,
+    csv_text        TEXT        NOT NULL,
+    row_count       INTEGER,
+    uploaded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (enrollment_code, mode)
+);
+"""
+
+UPSERT_SQL = """
+INSERT INTO metric_uploads (enrollment_code, mode, filename, csv_text, row_count, uploaded_at)
+VALUES (%s, %s, %s, %s, %s, now())
+ON CONFLICT (enrollment_code, mode)
+DO UPDATE SET filename    = EXCLUDED.filename,
+              csv_text    = EXCLUDED.csv_text,
+              row_count   = EXCLUDED.row_count,
+              uploaded_at = now()
+RETURNING uploaded_at;
+"""
+
+LIST_SQL = """
+SELECT enrollment_code, mode, filename, row_count, uploaded_at
+FROM metric_uploads
+{where}
+ORDER BY enrollment_code, mode;
+"""
+
+
+def db_connect():
+    """Open a Postgres connection, or fail clearly if the server isn't wired up."""
+    if not DATABASE_URL:
+        raise HTTPException(status_code=500, detail="Database not configured.")
+    try:
+        return psycopg2.connect(DATABASE_URL)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Database connection failed: {type(e).__name__}")
+
+
+def ensure_table(cur) -> None:
+    """Create the uploads table if it doesn't exist yet. Idempotent and cheap."""
+    cur.execute(CREATE_TABLE_SQL)
+
+
+@app.on_event("startup")
+def init_db() -> None:
+    """Best-effort table creation on boot. If the DB is down the agent still runs."""
+    if not DATABASE_URL:
+        return
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn, conn.cursor() as cur:
+            ensure_table(cur)
+        conn.close()
+    except Exception as e:
+        print(f"[startup] could not initialise database: {type(e).__name__}: {e}")
 
 
 # --------------------------------------------------------------------------
@@ -175,6 +264,19 @@ Date: {req.date or "(not specified)"}
 
 
 # --------------------------------------------------------------------------
+# Auth
+# --------------------------------------------------------------------------
+def check_auth(authorization: str | None) -> None:
+    """Reject anyone who doesn't send the shared app token."""
+    if not VAGIS_APP_TOKEN:
+        # Server misconfigured -- fail closed rather than run wide open.
+        raise HTTPException(status_code=500, detail="Server token not configured.")
+    expected = f"Bearer {VAGIS_APP_TOKEN}"
+    if authorization != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized.")
+
+
+# --------------------------------------------------------------------------
 # Endpoints
 # --------------------------------------------------------------------------
 @app.get("/health")
@@ -185,17 +287,8 @@ def health() -> dict[str, Any]:
         "model": MODEL,
         "anthropic_key_set": bool(ANTHROPIC_API_KEY),
         "app_token_set": bool(VAGIS_APP_TOKEN),
+        "database_url_set": bool(DATABASE_URL),
     }
-
-
-def check_auth(authorization: str | None) -> None:
-    """Reject anyone who doesn't send the shared app token."""
-    if not VAGIS_APP_TOKEN:
-        # Server misconfigured -- fail closed rather than run wide open.
-        raise HTTPException(status_code=500, detail="Server token not configured.")
-    expected = f"Bearer {VAGIS_APP_TOKEN}"
-    if authorization != expected:
-        raise HTTPException(status_code=401, detail="Unauthorized.")
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -228,3 +321,123 @@ def chat(req: ChatRequest, authorization: str | None = Header(default=None)) -> 
         raise HTTPException(status_code=502, detail="Empty reply from model.")
 
     return ChatResponse(reply=reply)
+
+
+def normalise_enrollment_code(raw: str) -> str:
+    """Trim and upper-case; require the RP-/SE- shape the app already uses."""
+    code = (raw or "").strip().upper()
+    if not code:
+        raise HTTPException(status_code=400, detail="enrollment_code is required.")
+    if not (code.startswith("RP-") or code.startswith("SE-")):
+        raise HTTPException(
+            status_code=400,
+            detail="enrollment_code must start with 'RP-' or 'SE-'.",
+        )
+    return code
+
+
+def count_csv_rows(text: str) -> int:
+    """Data rows only (header excluded). Uses the csv module so quoted newlines
+    inside a field don't inflate the count."""
+    reader = csv.reader(io.StringIO(text))
+    n = sum(1 for _ in reader)
+    return max(0, n - 1)
+
+
+@app.post("/ingest")
+async def ingest(
+    enrollment_code: str = Form(...),
+    mode: str = Form(...),
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Receive one cumulative CSV for a given enrollment code + mode and store it.
+
+    Multipart form fields:
+        enrollment_code : RP-xxxx or SE-xxxx  (the subject's stored code)
+        mode            : sleep | stand | rest | breathwork | ...  (free-form)
+        file            : the cumulative CSV
+
+    Cumulative semantics: re-uploading the same code + mode replaces the prior
+    file for that pair. Any mode's columns are accepted as-is.
+    """
+    check_auth(authorization)
+
+    code = normalise_enrollment_code(enrollment_code)
+    mode_clean = (mode or "").strip().lower()
+    if not mode_clean:
+        raise HTTPException(status_code=400, detail="mode is required.")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File too large.")
+
+    try:
+        csv_text = raw.decode("utf-8-sig")  # -sig strips a BOM if present
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="File must be UTF-8 text CSV.")
+
+    row_count = count_csv_rows(csv_text)
+
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_table(cur)
+            cur.execute(
+                UPSERT_SQL,
+                (code, mode_clean, file.filename, csv_text, row_count),
+            )
+            uploaded_at = cur.fetchone()[0]
+    finally:
+        conn.close()
+
+    return {
+        "status": "ok",
+        "enrollment_code": code,
+        "mode": mode_clean,
+        "filename": file.filename,
+        "row_count": row_count,
+        "uploaded_at": uploaded_at.isoformat(),
+    }
+
+
+@app.get("/ingest/list")
+def ingest_list(
+    enrollment_code: str | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """List what's been uploaded (metadata only, no CSV bodies).
+
+    Optional ?enrollment_code=SE-xxxx filters to one subject. This is the read
+    the portal will build on, and it lets you verify uploads landed.
+    """
+    check_auth(authorization)
+
+    params: tuple[Any, ...] = ()
+    where = ""
+    if enrollment_code:
+        where = "WHERE enrollment_code = %s"
+        params = (enrollment_code.strip().upper(),)
+
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_table(cur)
+            cur.execute(LIST_SQL.format(where=where), params)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    items = [
+        {
+            "enrollment_code": r[0],
+            "mode": r[1],
+            "filename": r[2],
+            "row_count": r[3],
+            "uploaded_at": r[4].isoformat() if r[4] else None,
+        }
+        for r in rows
+    ]
+    return {"count": len(items), "items": items}
