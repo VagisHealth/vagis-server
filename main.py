@@ -1,34 +1,29 @@
 """
-Vagis backend — agent relay server + metric ingestion.
+Vagis backend — agent relay + metric ingestion + enrollment-code registry.
 
-This is the always-on server that sits between the Vagis app and Claude.
-The app never calls Anthropic directly and never holds the API key. Instead:
+    Vagis app  ->  POST /chat    (holds the key)   ->  Anthropic API
+    Vagis app  ->  POST /ingest  (code, mode, CSV)  ->  Postgres
+    You        ->  POST /admin/researchers          ->  issues an RP code
+    Researcher ->  POST /portal/subjects            ->  issues an SE code
+    App        ->  POST /portal/validate            ->  checks an SE code is real
 
-    Vagis app  ->  POST /chat (this server, holds the key)  ->  Anthropic API
-    Vagis app  <-  reply                                    <-  Anthropic API
-
-Why this exists:
-  * The API key lives ONLY here, in an environment variable. It is never shipped
-    in the app, so any tester's phone can use the agent without a key of their own.
-  * The system prompt is built HERE, server-side. Updating the agent's behaviour
-    or knowledge is a server edit + restart -- no app release. Every tester goes
-    current immediately. (This is what fixes "stuck on an old version".)
-  * The server does NOT hardcode Vagis metric names. The app sends whatever metrics
-    it currently computes; the server formats them generically. Add a metric or a
-    mode in the app and the agent reflects it automatically, with no server change.
-
-This same server is also the ingestion backend for the research portal. The app
-uploads cumulative CSV metric files (Sleep, Stand, Rest, Breathwork, ...) tagged
-with the subject's enrollment code; the server stores them in Postgres so they
-survive redeploys and can later be read by the portal.
-
-    Vagis app  ->  POST /ingest (enrollment_code, mode, CSV)  ->  Postgres
+Enrollment code scheme (no hyphens):
+    Researcher : RP + 3 digits                       e.g. RP014
+    Subject    : SE + rp(3) + user(4) + tail(3) = 12 e.g. SE0140001Q4J
+The embedded RP digits let a researcher's portal show only their own subjects.
+The random tail (unambiguous alphabet, no O/0/I/1/L) means a mistyped code fails
+cleanly instead of silently matching another real subject.
 
 Endpoints:
-    GET  /health        -- server status
-    POST /chat          -- personal agent relay
-    POST /ingest        -- upload a cumulative CSV for one enrollment code + mode
-    GET  /ingest/list   -- list what's been uploaded (verification / portal read)
+    GET  /health              -- server status
+    POST /chat                -- personal agent relay
+    POST /ingest              -- upload a cumulative CSV for one code + mode
+    GET  /ingest/list         -- list uploads (verification / portal read)
+    POST /admin/researchers   -- (admin) issue an RP code for a researcher
+    GET  /admin/researchers   -- (admin) list researchers
+    POST /portal/subjects     -- (researcher) issue the next SE code under their RP
+    GET  /portal/subjects     -- (researcher) list their own subjects
+    POST /portal/validate     -- (app) confirm an SE code exists, return its RP
 """
 
 from __future__ import annotations
@@ -36,11 +31,13 @@ from __future__ import annotations
 import csv
 import io
 import os
-from typing import Any
+import secrets
+from typing import Any, Optional
 
 import anthropic
 import psycopg2
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 # --------------------------------------------------------------------------
@@ -48,23 +45,23 @@ from pydantic import BaseModel, Field
 # --------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-# A shared secret the app sends in the Authorization header. This stops random
-# people on the internet from hitting /chat and spending your Anthropic credits.
-# Generate one with:  python -c "import secrets; print(secrets.token_urlsafe(32))"
+# Shared secret the APP sends (Authorization: Bearer ...). Ships in the app, so
+# treat it as "keeps randoms out", not as a high-value secret.
 VAGIS_APP_TOKEN = os.environ.get("VAGIS_APP_TOKEN", "")
 
-# One line to switch models. Sonnet = best speed/cost for chat; swap to
-# "claude-opus-4-8" for deeper reasoning at higher cost/latency.
+# ADMIN secret only YOU know. Protects RP-code issuing. Never ships in the app.
+# Generate one with:  python -c "import secrets; print(secrets.token_urlsafe(32))"
+VAGIS_ADMIN_TOKEN = os.environ.get("VAGIS_ADMIN_TOKEN", "")
+
 MODEL = os.environ.get("VAGIS_MODEL", "claude-sonnet-4-6")
 MAX_TOKENS = int(os.environ.get("VAGIS_MAX_TOKENS", "1024"))
 
-# Postgres connection string. On Render this is the Internal Database URL of
-# vagis-db, set as the DATABASE_URL environment variable on this service.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-# Reject absurdly large uploads. Cumulative metric CSVs are tiny (a few KB);
-# 10 MB is a generous ceiling that still blocks abuse.
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
+# Unambiguous alphabet for the random tail: no O, 0, I, 1, L.
+CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -72,13 +69,55 @@ app = FastAPI(title="Vagis Agent Server")
 
 
 # --------------------------------------------------------------------------
-# Database helpers
+# Enrollment code helpers  (pure functions -- unit tested)
 # --------------------------------------------------------------------------
-# One row per (enrollment_code, mode). Uploads are cumulative masters, so a new
-# upload for the same code + mode REPLACES the previous one (upsert). csv_text
-# holds the whole file verbatim -- ingestion stays schema-agnostic, so each mode
-# can have completely different columns and nothing here needs to change.
-CREATE_TABLE_SQL = """
+def make_rp_code(seq: int) -> str:
+    if not (1 <= seq <= 999):
+        raise ValueError("RP sequence out of range (1-999)")
+    return f"RP{seq:03d}"
+
+
+def make_se_code(rp_seq: int, user_seq: int) -> str:
+    if not (1 <= rp_seq <= 999):
+        raise ValueError("RP sequence out of range (1-999)")
+    if not (1 <= user_seq <= 9999):
+        raise ValueError("user sequence out of range (1-9999)")
+    tail = "".join(secrets.choice(CODE_ALPHABET) for _ in range(3))
+    return f"SE{rp_seq:03d}{user_seq:04d}{tail}"
+
+
+def parse_rp_code(code: str) -> Optional[dict[str, Any]]:
+    code = (code or "").strip().upper()
+    if len(code) != 5 or not code.startswith("RP"):
+        return None
+    digits = code[2:5]
+    if not digits.isdigit():
+        return None
+    return {"rp_code": code, "rp_seq": int(digits)}
+
+
+def parse_se_code(code: str) -> Optional[dict[str, Any]]:
+    code = (code or "").strip().upper()
+    if len(code) != 12 or not code.startswith("SE"):
+        return None
+    rp_digits, user_digits, tail = code[2:5], code[5:9], code[9:12]
+    if not rp_digits.isdigit() or not user_digits.isdigit():
+        return None
+    if any(c not in CODE_ALPHABET for c in tail):
+        return None
+    return {
+        "se_code": code,
+        "rp_code": f"RP{rp_digits}",
+        "rp_seq": int(rp_digits),
+        "user_seq": int(user_digits),
+        "tail": tail,
+    }
+
+
+# --------------------------------------------------------------------------
+# Database
+# --------------------------------------------------------------------------
+CREATE_UPLOADS_SQL = """
 CREATE TABLE IF NOT EXISTS metric_uploads (
     id              SERIAL PRIMARY KEY,
     enrollment_code TEXT        NOT NULL,
@@ -91,7 +130,29 @@ CREATE TABLE IF NOT EXISTS metric_uploads (
 );
 """
 
-UPSERT_SQL = """
+CREATE_RESEARCHERS_SQL = """
+CREATE TABLE IF NOT EXISTS researchers (
+    rp_code    TEXT PRIMARY KEY,
+    rp_seq     INTEGER NOT NULL UNIQUE,
+    name       TEXT,
+    email      TEXT,
+    secret     TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+CREATE_SUBJECTS_SQL = """
+CREATE TABLE IF NOT EXISTS subjects (
+    se_code    TEXT PRIMARY KEY,
+    rp_code    TEXT NOT NULL REFERENCES researchers(rp_code),
+    user_seq   INTEGER NOT NULL,
+    label      TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (rp_code, user_seq)
+);
+"""
+
+UPSERT_UPLOAD_SQL = """
 INSERT INTO metric_uploads (enrollment_code, mode, filename, csv_text, row_count, uploaded_at)
 VALUES (%s, %s, %s, %s, %s, now())
 ON CONFLICT (enrollment_code, mode)
@@ -102,7 +163,7 @@ DO UPDATE SET filename    = EXCLUDED.filename,
 RETURNING uploaded_at;
 """
 
-LIST_SQL = """
+LIST_UPLOADS_SQL = """
 SELECT enrollment_code, mode, filename, row_count, uploaded_at
 FROM metric_uploads
 {where}
@@ -111,7 +172,6 @@ ORDER BY enrollment_code, mode;
 
 
 def db_connect():
-    """Open a Postgres connection, or fail clearly if the server isn't wired up."""
     if not DATABASE_URL:
         raise HTTPException(status_code=500, detail="Database not configured.")
     try:
@@ -120,58 +180,72 @@ def db_connect():
         raise HTTPException(status_code=502, detail=f"Database connection failed: {type(e).__name__}")
 
 
-def ensure_table(cur) -> None:
-    """Create the uploads table if it doesn't exist yet. Idempotent and cheap."""
-    cur.execute(CREATE_TABLE_SQL)
+def ensure_tables(cur) -> None:
+    cur.execute(CREATE_RESEARCHERS_SQL)  # referenced by subjects, create first
+    cur.execute(CREATE_SUBJECTS_SQL)
+    cur.execute(CREATE_UPLOADS_SQL)
 
 
 @app.on_event("startup")
 def init_db() -> None:
-    """Best-effort table creation on boot. If the DB is down the agent still runs."""
     if not DATABASE_URL:
         return
     try:
         conn = psycopg2.connect(DATABASE_URL)
         with conn, conn.cursor() as cur:
-            ensure_table(cur)
+            ensure_tables(cur)
         conn.close()
     except Exception as e:
         print(f"[startup] could not initialise database: {type(e).__name__}: {e}")
 
 
 # --------------------------------------------------------------------------
+# Auth
+# --------------------------------------------------------------------------
+def check_app_auth(authorization: str | None) -> None:
+    """App-level shared token (Authorization: Bearer <VAGIS_APP_TOKEN>)."""
+    if not VAGIS_APP_TOKEN:
+        raise HTTPException(status_code=500, detail="Server token not configured.")
+    if authorization != f"Bearer {VAGIS_APP_TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized.")
+
+
+def check_admin_auth(authorization: str | None) -> None:
+    """Admin token, only you (Authorization: Bearer <VAGIS_ADMIN_TOKEN>)."""
+    if not VAGIS_ADMIN_TOKEN:
+        raise HTTPException(status_code=500, detail="Admin token not configured.")
+    if authorization != f"Bearer {VAGIS_ADMIN_TOKEN}":
+        raise HTTPException(status_code=401, detail="Admin unauthorized.")
+
+
+def authenticate_researcher(cur, rp_code: str, secret: str) -> dict[str, Any]:
+    """Confirm rp_code + secret match a real researcher; return their row."""
+    parsed = parse_rp_code(rp_code)
+    if not parsed:
+        raise HTTPException(status_code=400, detail="Malformed RP code.")
+    cur.execute(
+        "SELECT rp_code, rp_seq, secret FROM researchers WHERE rp_code = %s",
+        (parsed["rp_code"],),
+    )
+    row = cur.fetchone()
+    if not row or not secret or not secrets.compare_digest(row[2], secret):
+        raise HTTPException(status_code=401, detail="Invalid researcher credentials.")
+    return {"rp_code": row[0], "rp_seq": row[1]}
+
+
+# --------------------------------------------------------------------------
 # Request / response shapes
 # --------------------------------------------------------------------------
 class Turn(BaseModel):
-    """One message in the running conversation."""
-    role: str          # "user" or "assistant"
+    role: str
     content: str
 
 
 class ChatRequest(BaseModel):
-    # What the user was recording. Free-form string -- whatever the app calls
-    # the mode (Sleep, Stand, Rest, Breathwork, Circadian, ...). The server does
-    # not need to know the set in advance.
     mode: str = ""
-
-    # Human-readable session date, as the app already formats it.
     date: str = ""
-
-    # The user's own metrics for the session they're looking at.
-    # Flexible by design: a dict of section name -> { metric label: value }.
-    # Example the app might send:
-    #   {
-    #     "HRV":   {"RMSSD": "42 ms", "%VLF": "31 %", "SDNN": "55 ms"},
-    #     "Sleep": {"AMMA": "0.71", "PWAD index": "12.4"}
-    #   }
-    # Add/rename anything app-side; it renders here untouched.
     metrics: dict[str, dict[str, Any]] = Field(default_factory=dict)
-
-    # Optional short summary of recent sessions for longitudinal context.
     history_summary: str = ""
-
-    # The running chat. The app keeps this and resends it each turn, because
-    # the model itself is stateless.
     conversation: list[Turn] = Field(default_factory=list)
 
 
@@ -179,8 +253,23 @@ class ChatResponse(BaseModel):
     reply: str
 
 
+class IssueResearcherRequest(BaseModel):
+    name: str = ""
+    email: str = ""
+
+
+class IssueSubjectRequest(BaseModel):
+    rp_code: str
+    secret: str
+    label: str = ""          # optional private note, e.g. "pilot subject 3"
+
+
+class ValidateRequest(BaseModel):
+    se_code: str
+
+
 # --------------------------------------------------------------------------
-# System prompt  (built here -- the single source of the agent's behaviour)
+# System prompt
 # --------------------------------------------------------------------------
 def render_metrics(metrics: dict[str, dict[str, Any]]) -> str:
     if not metrics:
@@ -264,36 +353,23 @@ Date: {req.date or "(not specified)"}
 
 
 # --------------------------------------------------------------------------
-# Auth
-# --------------------------------------------------------------------------
-def check_auth(authorization: str | None) -> None:
-    """Reject anyone who doesn't send the shared app token."""
-    if not VAGIS_APP_TOKEN:
-        # Server misconfigured -- fail closed rather than run wide open.
-        raise HTTPException(status_code=500, detail="Server token not configured.")
-    expected = f"Bearer {VAGIS_APP_TOKEN}"
-    if authorization != expected:
-        raise HTTPException(status_code=401, detail="Unauthorized.")
-
-
-# --------------------------------------------------------------------------
-# Endpoints
+# Endpoints: health + chat
 # --------------------------------------------------------------------------
 @app.get("/health")
 def health() -> dict[str, Any]:
-    """Quick check that the server is up and configured. Hit this in a browser."""
     return {
         "status": "ok",
         "model": MODEL,
         "anthropic_key_set": bool(ANTHROPIC_API_KEY),
         "app_token_set": bool(VAGIS_APP_TOKEN),
+        "admin_token_set": bool(VAGIS_ADMIN_TOKEN),
         "database_url_set": bool(DATABASE_URL),
     }
 
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, authorization: str | None = Header(default=None)) -> ChatResponse:
-    check_auth(authorization)
+    check_app_auth(authorization)
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=500, detail="Anthropic key not configured.")
     if not req.conversation:
@@ -311,7 +387,7 @@ def chat(req: ChatRequest, authorization: str | None = Header(default=None)) -> 
         )
     except anthropic.APIStatusError as e:
         raise HTTPException(status_code=502, detail=f"Anthropic error: {e.status_code}")
-    except Exception as e:  # network etc.
+    except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream error: {type(e).__name__}")
 
     reply = "".join(
@@ -323,25 +399,18 @@ def chat(req: ChatRequest, authorization: str | None = Header(default=None)) -> 
     return ChatResponse(reply=reply)
 
 
-def normalise_enrollment_code(raw: str) -> str:
-    """Trim and upper-case; require the RP-/SE- shape the app already uses."""
-    code = (raw or "").strip().upper()
-    if not code:
-        raise HTTPException(status_code=400, detail="enrollment_code is required.")
-    if not (code.startswith("RP-") or code.startswith("SE-")):
-        raise HTTPException(
-            status_code=400,
-            detail="enrollment_code must start with 'RP-' or 'SE-'.",
-        )
-    return code
-
-
+# --------------------------------------------------------------------------
+# Endpoints: ingestion
+# --------------------------------------------------------------------------
 def count_csv_rows(text: str) -> int:
-    """Data rows only (header excluded). Uses the csv module so quoted newlines
-    inside a field don't inflate the count."""
     reader = csv.reader(io.StringIO(text))
     n = sum(1 for _ in reader)
     return max(0, n - 1)
+
+
+def subject_exists(cur, se_code: str) -> bool:
+    cur.execute("SELECT 1 FROM subjects WHERE se_code = %s", (se_code,))
+    return cur.fetchone() is not None
 
 
 @app.post("/ingest")
@@ -351,19 +420,17 @@ async def ingest(
     file: UploadFile = File(...),
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    """Receive one cumulative CSV for a given enrollment code + mode and store it.
+    """Store one cumulative CSV for a subject + mode. Re-upload replaces prior."""
+    check_app_auth(authorization)
 
-    Multipart form fields:
-        enrollment_code : RP-xxxx or SE-xxxx  (the subject's stored code)
-        mode            : sleep | stand | rest | breathwork | ...  (free-form)
-        file            : the cumulative CSV
+    parsed = parse_se_code(enrollment_code)
+    if not parsed:
+        raise HTTPException(
+            status_code=400,
+            detail="enrollment_code must be a valid SE code (e.g. SE0140001Q4J).",
+        )
+    code = parsed["se_code"]
 
-    Cumulative semantics: re-uploading the same code + mode replaces the prior
-    file for that pair. Any mode's columns are accepted as-is.
-    """
-    check_auth(authorization)
-
-    code = normalise_enrollment_code(enrollment_code)
     mode_clean = (mode or "").strip().lower()
     if not mode_clean:
         raise HTTPException(status_code=400, detail="mode is required.")
@@ -373,9 +440,8 @@ async def ingest(
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
     if len(raw) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File too large.")
-
     try:
-        csv_text = raw.decode("utf-8-sig")  # -sig strips a BOM if present
+        csv_text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail="File must be UTF-8 text CSV.")
 
@@ -384,9 +450,15 @@ async def ingest(
     conn = db_connect()
     try:
         with conn, conn.cursor() as cur:
-            ensure_table(cur)
+            ensure_tables(cur)
+            # The code must have been issued through the registry first.
+            if not subject_exists(cur, code):
+                raise HTTPException(
+                    status_code=404,
+                    detail="Unknown enrollment code. It must be issued before uploading.",
+                )
             cur.execute(
-                UPSERT_SQL,
+                UPSERT_UPLOAD_SQL,
                 (code, mode_clean, file.filename, csv_text, row_count),
             )
             uploaded_at = cur.fetchone()[0]
@@ -408,13 +480,7 @@ def ingest_list(
     enrollment_code: str | None = None,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    """List what's been uploaded (metadata only, no CSV bodies).
-
-    Optional ?enrollment_code=SE-xxxx filters to one subject. This is the read
-    the portal will build on, and it lets you verify uploads landed.
-    """
-    check_auth(authorization)
-
+    check_app_auth(authorization)
     params: tuple[Any, ...] = ()
     where = ""
     if enrollment_code:
@@ -424,8 +490,8 @@ def ingest_list(
     conn = db_connect()
     try:
         with conn, conn.cursor() as cur:
-            ensure_table(cur)
-            cur.execute(LIST_SQL.format(where=where), params)
+            ensure_tables(cur)
+            cur.execute(LIST_UPLOADS_SQL.format(where=where), params)
             rows = cur.fetchall()
     finally:
         conn.close()
@@ -441,3 +507,313 @@ def ingest_list(
         for r in rows
     ]
     return {"count": len(items), "items": items}
+
+
+# --------------------------------------------------------------------------
+# Endpoints: registry (admin issues RP, researcher issues SE, app validates SE)
+# --------------------------------------------------------------------------
+@app.post("/admin/researchers")
+def issue_researcher(
+    req: IssueResearcherRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """ADMIN: create the next researcher. Returns their RP code and secret.
+    Give the researcher BOTH -- the secret is how they issue subjects and, later,
+    log into their portal. Store it safely; it is shown once here."""
+    check_admin_auth(authorization)
+    secret = secrets.token_urlsafe(24)
+
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            cur.execute("SELECT COALESCE(MAX(rp_seq), 0) FROM researchers;")
+            next_seq = cur.fetchone()[0] + 1
+            if next_seq > 999:
+                raise HTTPException(status_code=409, detail="RP capacity reached (999).")
+            rp_code = make_rp_code(next_seq)
+            cur.execute(
+                "INSERT INTO researchers (rp_code, rp_seq, name, email, secret) "
+                "VALUES (%s, %s, %s, %s, %s);",
+                (rp_code, next_seq, req.name or None, req.email or None, secret),
+            )
+    finally:
+        conn.close()
+
+    return {"status": "ok", "rp_code": rp_code, "secret": secret,
+            "name": req.name, "email": req.email}
+
+
+@app.get("/admin/researchers")
+def list_researchers(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """ADMIN: list researchers (no secrets returned)."""
+    check_admin_auth(authorization)
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            cur.execute(
+                "SELECT r.rp_code, r.name, r.email, r.created_at, "
+                "(SELECT COUNT(*) FROM subjects s WHERE s.rp_code = r.rp_code) "
+                "FROM researchers r ORDER BY r.rp_seq;"
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {
+        "count": len(rows),
+        "items": [
+            {"rp_code": r[0], "name": r[1], "email": r[2],
+             "created_at": r[3].isoformat() if r[3] else None, "subjects": r[4]}
+            for r in rows
+        ],
+    }
+
+
+@app.post("/portal/subjects")
+def issue_subject(
+    req: IssueSubjectRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """RESEARCHER: issue the next SE code under their own RP. Auth = rp_code + secret.
+    (The Authorization header still carries the app token, so the endpoint isn't open.)"""
+    check_app_auth(authorization)
+
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            researcher = authenticate_researcher(cur, req.rp_code, req.secret)
+            cur.execute(
+                "SELECT COALESCE(MAX(user_seq), 0) FROM subjects WHERE rp_code = %s;",
+                (researcher["rp_code"],),
+            )
+            next_user = cur.fetchone()[0] + 1
+            if next_user > 9999:
+                raise HTTPException(status_code=409, detail="Subject capacity reached (9999).")
+            se_code = make_se_code(researcher["rp_seq"], next_user)
+            cur.execute(
+                "INSERT INTO subjects (se_code, rp_code, user_seq, label) "
+                "VALUES (%s, %s, %s, %s);",
+                (se_code, researcher["rp_code"], next_user, req.label or None),
+            )
+    finally:
+        conn.close()
+
+    return {"status": "ok", "se_code": se_code, "rp_code": researcher["rp_code"],
+            "user_seq": next_user}
+
+
+@app.get("/portal/subjects")
+def list_subjects(
+    rp_code: str,
+    secret: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """RESEARCHER: list their own subjects (auth = rp_code + secret as query params)."""
+    check_app_auth(authorization)
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            researcher = authenticate_researcher(cur, rp_code, secret)
+            cur.execute(
+                "SELECT se_code, user_seq, label, created_at FROM subjects "
+                "WHERE rp_code = %s ORDER BY user_seq;",
+                (researcher["rp_code"],),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {
+        "rp_code": researcher["rp_code"],
+        "count": len(rows),
+        "items": [
+            {"se_code": r[0], "user_seq": r[1], "label": r[2],
+             "created_at": r[3].isoformat() if r[3] else None}
+            for r in rows
+        ],
+    }
+
+
+@app.post("/portal/validate")
+def validate_subject(
+    req: ValidateRequest,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """APP: confirm an SE code is well-formed AND issued. Returns its RP if valid.
+    The app calls this when a user enters their code, before storing it."""
+    check_app_auth(authorization)
+    parsed = parse_se_code(req.se_code)
+    if not parsed:
+        return {"valid": False, "reason": "malformed"}
+
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            cur.execute(
+                "SELECT rp_code FROM subjects WHERE se_code = %s;",
+                (parsed["se_code"],),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        return {"valid": False, "reason": "not_issued"}
+    return {"valid": True, "se_code": parsed["se_code"], "rp_code": row[0]}
+
+
+# --------------------------------------------------------------------------
+# Admin page  (private single-screen tool: create a researcher, see the list)
+# --------------------------------------------------------------------------
+# Served at GET /admin. The page holds no secret itself -- every action requires
+# you to paste your admin token, which is used only to call the /admin/* API.
+ADMIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vagis Admin</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         max-width: 760px; margin: 0 auto; padding: 24px; color: #1a1a1a; background: #fafafa; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: #666; font-size: 14px; margin: 0 0 24px; }
+  .card { background: #fff; border: 1px solid #e4e4e4; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+  .card h2 { font-size: 16px; font-weight: 600; margin: 0 0 14px; }
+  label { display: block; font-size: 13px; color: #444; margin: 12px 0 4px; }
+  input { width: 100%; padding: 10px 12px; font-size: 15px; border: 1px solid #d0d0d0;
+          border-radius: 8px; background: #fff; }
+  button { margin-top: 16px; padding: 10px 18px; font-size: 15px; font-weight: 500; color: #fff;
+           background: #0f6e56; border: none; border-radius: 8px; cursor: pointer; }
+  button.secondary { background: #444; }
+  button:disabled { opacity: .5; cursor: default; }
+  .result { margin-top: 16px; padding: 16px; border-radius: 8px; background: #e1f5ee;
+            border: 1px solid #9fe1cb; display: none; }
+  .result.show { display: block; }
+  .result .row { display: flex; justify-content: space-between; align-items: center;
+                 padding: 6px 0; font-size: 15px; }
+  .result .k { color: #085041; font-weight: 500; }
+  .result .v { font-family: ui-monospace, Menlo, monospace; font-size: 15px; }
+  .warn { color: #854f0b; font-size: 13px; margin-top: 10px; }
+  .copybtn { margin: 0 0 0 10px; padding: 4px 10px; font-size: 12px; background: #085041; }
+  table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #eee; }
+  th { color: #666; font-weight: 500; font-size: 12px; text-transform: uppercase; }
+  td.mono { font-family: ui-monospace, Menlo, monospace; }
+  .err { color: #a32d2d; font-size: 14px; margin-top: 10px; }
+  .muted { color: #999; font-size: 13px; }
+</style>
+</head>
+<body>
+  <h1>Vagis Admin</h1>
+  <p class="sub">Create researcher accounts and view the list. Private tool.</p>
+
+  <div class="card">
+    <h2>Your admin token</h2>
+    <input id="token" type="password" placeholder="Paste your VAGIS_ADMIN_TOKEN here" autocomplete="off">
+    <p class="muted">Entered once per visit. Never stored on this page.</p>
+  </div>
+
+  <div class="card">
+    <h2>Create a researcher</h2>
+    <label>Name (optional)</label>
+    <input id="name" type="text" placeholder="Dr. Jane Smith">
+    <label>Email (optional)</label>
+    <input id="email" type="text" placeholder="jane@example.com">
+    <button id="createBtn" onclick="createResearcher()">Create researcher</button>
+    <div id="result" class="result"></div>
+    <div id="createErr" class="err"></div>
+  </div>
+
+  <div class="card">
+    <h2>Researchers</h2>
+    <button class="secondary" onclick="loadResearchers()">Refresh list</button>
+    <div id="listErr" class="err"></div>
+    <table id="table" style="display:none">
+      <thead><tr><th>RP code</th><th>Name</th><th>Email</th><th>Subjects</th><th>Created</th></tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <p id="empty" class="muted" style="display:none">No researchers yet.</p>
+  </div>
+
+<script>
+function tok() { return document.getElementById('token').value.trim(); }
+function hdr() { return { 'Authorization': 'Bearer ' + tok(), 'Content-Type': 'application/json' }; }
+
+function copy(text, btn) {
+  navigator.clipboard.writeText(text).then(function(){ btn.textContent = 'Copied'; setTimeout(function(){ btn.textContent = 'Copy'; }, 1200); });
+}
+
+async function createResearcher() {
+  var errEl = document.getElementById('createErr');
+  var resEl = document.getElementById('result');
+  errEl.textContent = ''; resEl.className = 'result';
+  if (!tok()) { errEl.textContent = 'Enter your admin token first.'; return; }
+  var btn = document.getElementById('createBtn');
+  btn.disabled = true; btn.textContent = 'Creating...';
+  try {
+    var r = await fetch('/admin/researchers', {
+      method: 'POST', headers: hdr(),
+      body: JSON.stringify({ name: document.getElementById('name').value, email: document.getElementById('email').value })
+    });
+    var d = await r.json();
+    if (!r.ok) { errEl.textContent = 'Error: ' + (d.detail || r.status); return; }
+    resEl.innerHTML =
+      '<div class="row"><span class="k">Researcher code (RP)</span>' +
+      '<span><span class="v">' + d.rp_code + '</span>' +
+      '<button class="copybtn" onclick="copy(\'' + d.rp_code + '\', this)">Copy</button></span></div>' +
+      '<div class="row"><span class="k">Secret</span>' +
+      '<span><span class="v">' + d.secret + '</span>' +
+      '<button class="copybtn" onclick="copy(\'' + d.secret + '\', this)">Copy</button></span></div>' +
+      '<div class="warn">Email BOTH to the researcher. The secret is how they log in and issue their users\\' codes. Save it now &mdash; the list below never shows secrets again.</div>';
+    resEl.className = 'result show';
+    document.getElementById('name').value = '';
+    document.getElementById('email').value = '';
+    loadResearchers();
+  } catch (e) {
+    errEl.textContent = 'Network error: ' + e.message;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Create researcher';
+  }
+}
+
+async function loadResearchers() {
+  var errEl = document.getElementById('listErr');
+  errEl.textContent = '';
+  if (!tok()) { errEl.textContent = 'Enter your admin token first.'; return; }
+  try {
+    var r = await fetch('/admin/researchers', { headers: hdr() });
+    var d = await r.json();
+    if (!r.ok) { errEl.textContent = 'Error: ' + (d.detail || r.status); return; }
+    var tb = document.getElementById('tbody');
+    tb.innerHTML = '';
+    if (!d.items || d.items.length === 0) {
+      document.getElementById('table').style.display = 'none';
+      document.getElementById('empty').style.display = 'block';
+      return;
+    }
+    document.getElementById('empty').style.display = 'none';
+    document.getElementById('table').style.display = 'table';
+    d.items.forEach(function(it) {
+      var created = it.created_at ? it.created_at.slice(0, 10) : '';
+      tb.innerHTML += '<tr><td class="mono">' + it.rp_code + '</td><td>' +
+        (it.name || '') + '</td><td>' + (it.email || '') + '</td><td>' +
+        it.subjects + '</td><td>' + created + '</td></tr>';
+    });
+  } catch (e) {
+    errEl.textContent = 'Network error: ' + e.message;
+  }
+}
+</script>
+</body>
+</html>"""
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page() -> HTMLResponse:
+    """Private single-screen admin tool. Actions require the admin token."""
+    return HTMLResponse(content=ADMIN_HTML)
