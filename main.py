@@ -773,10 +773,10 @@ def admin_ui_create(
 
     banner = (
         '<div class="result">'
-        f'<div class="row"><span class="k">Researcher code (RP)</span><span class="v">{rp_code}</span></div>'
-        f'<div class="row"><span class="k">Secret</span><span class="v">{secret}</span></div>'
-        '<div class="warn">Email BOTH to the researcher and save them now &mdash; '
-        'the list never shows the secret again.</div></div>'
+        f'<div class="row"><span class="k">Researcher ID</span><span class="v">{rp_code}</span></div>'
+        f'<div class="row"><span class="k">Key</span><span class="v">{secret}</span></div>'
+        '<div class="warn">Save both now &mdash; the key is never shown again. '
+        'Email them to the researcher you are onboarding.</div></div>'
     )
     return HTMLResponse(_admin_page(token, banner))
 
