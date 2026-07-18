@@ -769,7 +769,7 @@ async function createResearcher() {
       '<div class="row"><span class="k">Secret</span>' +
       '<span><span class="v">' + d.secret + '</span>' +
       '<button class="copybtn" onclick="copy(\'' + d.secret + '\', this)">Copy</button></span></div>' +
-      '<div class="warn">Email BOTH to the researcher. The secret is how they log in and issue their users\\' codes. Save it now &mdash; the list below never shows secrets again.</div>';
+      '<div class="warn">Email BOTH to the researcher. The secret is how they log in and issue subject codes. Save it now &mdash; the list below never shows secrets again.</div>';
     resEl.className = 'result show';
     document.getElementById('name').value = '';
     document.getElementById('email').value = '';
