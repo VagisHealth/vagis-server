@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS subjects (
     rp_code    TEXT NOT NULL REFERENCES researchers(rp_code),
     user_seq   INTEGER NOT NULL,
     label      TEXT,
+    email      TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (rp_code, user_seq)
 );
@@ -184,6 +185,8 @@ def ensure_tables(cur) -> None:
     cur.execute(CREATE_RESEARCHERS_SQL)  # referenced by subjects, create first
     cur.execute(CREATE_SUBJECTS_SQL)
     cur.execute(CREATE_UPLOADS_SQL)
+    # Migration for tables created before the email column existed.
+    cur.execute("ALTER TABLE subjects ADD COLUMN IF NOT EXISTS email TEXT;")
 
 
 @app.on_event("startup")
@@ -722,7 +725,7 @@ def _admin_page(token: str = "", banner: str = "") -> str:
       <input name="token" type="password" placeholder="Paste your VAGIS_ADMIN_TOKEN" value="{tok_val}" autocomplete="off">
       <label>Name (optional)</label>
       <input name="name" type="text" placeholder="Dr. Jane Smith">
-      <label>Email (optional)</label>
+      <label>Researcher email (required)</label>
       <input name="email" type="text" placeholder="jane@example.com">
       <button type="submit">Create researcher</button>
     </form>
@@ -754,6 +757,10 @@ def admin_ui_create(
         banner = '<div class="err">Admin token did not match. Check it and try again.</div>'
         return HTMLResponse(_admin_page(token, banner))
 
+    if not email.strip():
+        return HTMLResponse(_admin_page(token,
+            '<div class="err">A researcher email is required.</div>'))
+
     secret = secrets.token_urlsafe(24)
     conn = db_connect()
     try:
@@ -766,17 +773,26 @@ def admin_ui_create(
             rp_code = make_rp_code(next_seq)
             cur.execute(
                 "INSERT INTO researchers (rp_code, rp_seq, name, email, secret) VALUES (%s,%s,%s,%s,%s);",
-                (rp_code, next_seq, name or None, email or None, secret),
+                (rp_code, next_seq, name or None, email.strip(), secret),
             )
     finally:
         conn.close()
 
+    mail_body = (
+        f"Hello,\n\nYou have been set up as a researcher on Vagis. Your access details:\n\n"
+        f"Researcher ID: {rp_code}\nKey: {secret}\n\n"
+        f"Sign in at the researcher portal with these to view your subjects' shared data. "
+        f"Keep the Key private.\n\nThanks."
+    )
     banner = (
         '<div class="result">'
         f'<div class="row"><span class="k">Researcher ID</span><span class="v">{rp_code}</span></div>'
         f'<div class="row"><span class="k">Key</span><span class="v">{secret}</span></div>'
-        '<div class="warn">Save both now &mdash; the key is never shown again. '
-        'Email them to the researcher you are onboarding.</div></div>'
+        f'<div class="row"><span class="k">Email</span><span class="v">{_esc(email.strip())}</span></div>'
+        '<div class="warn">The key is never shown again after you leave this page.</div>'
+        + _mailto_button(email.strip(), "Your Vagis researcher access", mail_body,
+                         "Email this researcher")
+        + '</div>'
     )
     return HTMLResponse(_admin_page(token, banner))
 
@@ -814,3 +830,345 @@ def admin_ui_list(token: str = Form("")) -> HTMLResponse:
     banner = f'<div class="card"><h2>Researchers ({len(rows)})</h2>{table}' \
              f'<a class="back" href="/admin">&larr; Back</a></div>'
     return HTMLResponse(_admin_page(token, banner))
+
+
+# --------------------------------------------------------------------------
+# Researcher portal  (NO JavaScript -- plain HTML forms, like the admin page)
+# --------------------------------------------------------------------------
+# GET  /portal              -> login page (Researcher ID + Key)
+# POST /portal/ui/dashboard -> authenticate, show subjects + issue button
+# POST /portal/ui/issue     -> issue the next SE code, back to dashboard
+# POST /portal/ui/subject   -> show one subject's modes
+# POST /portal/ui/view      -> show one mode's CSV as a read-only table
+#
+# Credentials (rp_code + key) travel in hidden form fields on every page, so no
+# cookies/sessions are needed and the key never lands in a URL. VIEW-ONLY:
+# there is no CSV download anywhere in this portal, by design.
+import csv as _csv
+import io as _io
+from html import escape as _esc
+from urllib.parse import quote as _q
+
+
+def _mailto_button(email: str, subject: str, body: str, text: str = "Email this person") -> str:
+    """A button that opens the device's default mail app, pre-filled. No service
+    needed. Returns empty string if there's no address."""
+    if not email:
+        return ""
+    href = f"mailto:{_q(email)}?subject={_q(subject)}&body={_q(body)}"
+    return (f'<a href="{href}" style="display:inline-block;margin-top:10px;padding:9px 16px;'
+            f'background:#0f6e56;color:#fff;border-radius:8px;font-size:14px;'
+            f'font-weight:500;text-decoration:none;">{_esc(text)}</a>')
+
+
+def _portal_style() -> str:
+    return """
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         max-width: 980px; margin: 0 auto; padding: 24px; color: #1a1a1a; background: #fafafa; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
+  h2 { font-size: 16px; font-weight: 600; margin: 0 0 14px; }
+  .sub { color: #666; font-size: 14px; margin: 0 0 24px; }
+  .card { background: #fff; border: 1px solid #e4e4e4; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+  label { display: block; font-size: 13px; color: #444; margin: 12px 0 4px; }
+  input { width: 100%; padding: 10px 12px; font-size: 15px; border: 1px solid #d0d0d0; border-radius: 8px; background: #fff; }
+  button { margin-top: 8px; padding: 9px 16px; font-size: 14px; font-weight: 500; color: #fff;
+           background: #0f6e56; border: none; border-radius: 8px; cursor: pointer; }
+  button.secondary { background: #444; }
+  button.small { padding: 6px 12px; font-size: 13px; margin: 0; }
+  form.inline { display: inline; margin: 0; }
+  .result { margin: 0 0 20px; padding: 16px; border-radius: 8px; background: #e1f5ee; border: 1px solid #9fe1cb; }
+  .result .row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 15px; }
+  .result .k { color: #085041; font-weight: 500; }
+  .result .v { font-family: ui-monospace, Menlo, monospace; font-size: 16px; }
+  .warn { color: #854f0b; font-size: 13px; margin-top: 8px; }
+  .err { margin: 0 0 20px; padding: 14px 16px; border-radius: 8px; background: #fcebeb; border: 1px solid #f7c1c1; color: #a32d2d; }
+  table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 14px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid #eee; white-space: nowrap; }
+  th { color: #666; font-weight: 600; font-size: 12px; text-transform: uppercase; background: #f4f4f4; position: sticky; top: 0; }
+  td.mono, .mono { font-family: ui-monospace, Menlo, monospace; }
+  .muted { color: #999; font-size: 13px; }
+  .tablewrap { overflow-x: auto; border: 1px solid #eee; border-radius: 8px; }
+  a.back, .backbtn { display: inline-block; margin-top: 8px; color: #0f6e56; font-size: 14px; background: none; padding: 0; }
+  .pill { display: inline-block; font-size: 11px; color: #0f6e56; background: #e1f5ee; border-radius: 5px; padding: 2px 8px; margin-left: 6px; }
+  .subrow { display: flex; align-items: center; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #f0f0f0; }
+  .subrow:last-child { border-bottom: none; }
+</style>
+"""
+
+
+def _hidden_creds(rp_code: str, key: str) -> str:
+    return (f'<input type="hidden" name="rp_code" value="{_esc(rp_code)}">'
+            f'<input type="hidden" name="key" value="{_esc(key)}">')
+
+
+def _portal_login(banner: str = "") -> str:
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vagis Researcher Portal</title>{_portal_style()}</head><body>
+  <h1>Vagis Researcher Portal</h1>
+  <p class="sub">Sign in to view your subjects' shared data.</p>
+  {banner}
+  <div class="card">
+    <h2>Sign in</h2>
+    <form method="post" action="/portal/ui/dashboard">
+      <label>Researcher ID</label>
+      <input name="rp_code" type="text" placeholder="e.g. RP001" autocomplete="off">
+      <label>Key</label>
+      <input name="key" type="password" placeholder="Your key" autocomplete="off">
+      <div><button type="submit">Sign in</button></div>
+    </form>
+  </div>
+</body></html>"""
+
+
+def _mode_label(mode: str) -> str:
+    return {"sleep": "Sleep", "rest": "Rest", "stand": "Stand",
+            "breathwork": "Breathwork"}.get(mode, mode.capitalize())
+
+
+def _portal_dashboard(rp: dict, key: str, cur, banner: str = "") -> str:
+    cur.execute(
+        "SELECT se_code, user_seq, label, email, created_at FROM subjects "
+        "WHERE rp_code = %s ORDER BY user_seq;", (rp["rp_code"],))
+    subs = cur.fetchall()
+    # Which modes each subject has uploaded.
+    cur.execute(
+        "SELECT enrollment_code, mode FROM metric_uploads WHERE enrollment_code IN "
+        "(SELECT se_code FROM subjects WHERE rp_code = %s);", (rp["rp_code"],))
+    modes_by_sub: dict[str, list[str]] = {}
+    for se, mode in cur.fetchall():
+        modes_by_sub.setdefault(se, []).append(mode)
+
+    if subs:
+        rows = ""
+        for se_code, seq, label, email, created in subs:
+            has = sorted(modes_by_sub.get(se_code, []))
+            pills = "".join(f'<span class="pill">{_esc(_mode_label(m))}</span>' for m in has) \
+                    or '<span class="muted" style="margin-left:6px">no data yet</span>'
+            created_s = created.isoformat()[:10] if created else ""
+            meta = " &middot; ".join(x for x in [_esc(label) if label else "", _esc(email) if email else ""] if x)
+            rows += (
+                f'<div class="subrow"><div>'
+                f'<span class="mono">{_esc(se_code)}</span>'
+                f'{(" &middot; " + meta) if meta else ""}{pills}'
+                f'<div class="muted">issued {created_s}</div></div>'
+                f'<form class="inline" method="post" action="/portal/ui/subject">'
+                f'{_hidden_creds(rp["rp_code"], key)}'
+                f'<input type="hidden" name="se_code" value="{_esc(se_code)}">'
+                f'<button class="small" type="submit">View</button></form></div>'
+            )
+        subjects_block = rows
+    else:
+        subjects_block = '<p class="muted">No subjects yet. Issue a code below to add your first.</p>'
+
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vagis Researcher Portal</title>{_portal_style()}</head><body>
+  <h1>Vagis Researcher Portal</h1>
+  <p class="sub">Signed in as <span class="mono">{_esc(rp["rp_code"])}</span>{(" &middot; " + _esc(rp["name"])) if rp.get("name") else ""}</p>
+  {banner}
+  <div class="card">
+    <h2>Issue a new subject code</h2>
+    <p class="muted">Creates the next code under your account. Email it to the subject to enrol them.</p>
+    <form method="post" action="/portal/ui/issue">
+      {_hidden_creds(rp["rp_code"], key)}
+      <label>Subject email (required)</label>
+      <input name="email" type="text" placeholder="subject@example.com">
+      <label>Label (optional, private to you)</label>
+      <input name="label" type="text" placeholder="e.g. pilot subject 1">
+      <div><button type="submit">Issue subject code</button></div>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Your subjects ({len(subs)})</h2>
+    {subjects_block}
+  </div>
+</body></html>"""
+
+
+@app.get("/portal", response_class=HTMLResponse)
+def portal_login_page() -> HTMLResponse:
+    return HTMLResponse(_portal_login())
+
+
+def _auth_or_login(cur, rp_code: str, key: str):
+    """Return researcher dict, or None if credentials fail."""
+    try:
+        return authenticate_researcher(cur, rp_code, key)
+    except HTTPException:
+        return None
+
+
+@app.post("/portal/ui/dashboard", response_class=HTMLResponse)
+def portal_dashboard(rp_code: str = Form(""), key: str = Form("")) -> HTMLResponse:
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            r = _auth_or_login(cur, rp_code, key)
+            if not r:
+                return HTMLResponse(_portal_login(
+                    '<div class="err">Wrong Researcher ID or Key.</div>'))
+            # fetch name for the header
+            cur.execute("SELECT name FROM researchers WHERE rp_code = %s;", (r["rp_code"],))
+            row = cur.fetchone()
+            r["name"] = row[0] if row else None
+            page = _portal_dashboard(r, key, cur)
+    finally:
+        conn.close()
+    return HTMLResponse(page)
+
+
+@app.post("/portal/ui/issue", response_class=HTMLResponse)
+def portal_issue(rp_code: str = Form(""), key: str = Form(""),
+                 label: str = Form(""), email: str = Form("")) -> HTMLResponse:
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            r = _auth_or_login(cur, rp_code, key)
+            if not r:
+                return HTMLResponse(_portal_login('<div class="err">Wrong Researcher ID or Key.</div>'))
+            cur.execute("SELECT name FROM researchers WHERE rp_code = %s;", (r["rp_code"],))
+            nm = cur.fetchone()
+            r["name"] = nm[0] if nm else None
+            if not email.strip():
+                return HTMLResponse(_portal_dashboard(r, key, cur,
+                    '<div class="err">A subject email is required.</div>'))
+            cur.execute("SELECT COALESCE(MAX(user_seq), 0) FROM subjects WHERE rp_code = %s;", (r["rp_code"],))
+            next_user = cur.fetchone()[0] + 1
+            if next_user > 9999:
+                return HTMLResponse(_portal_dashboard(r, key, cur,
+                    '<div class="err">Subject capacity reached (9999).</div>'))
+            se_code = make_se_code(r["rp_seq"], next_user)
+            cur.execute("INSERT INTO subjects (se_code, rp_code, user_seq, label, email) VALUES (%s,%s,%s,%s,%s);",
+                        (se_code, r["rp_code"], next_user, label or None, email.strip()))
+            mail_body = (
+                f"Hello,\n\nYou've been invited to share your Vagis data. Your enrollment code is:\n\n"
+                f"{se_code}\n\n"
+                f"Open the Vagis app, go to Data Share, enter this code, and follow the prompts. "
+                f"Only your metric summaries are shared \u2014 your raw recordings stay on your phone.\n\nThanks."
+            )
+            banner = (
+                '<div class="result">'
+                f'<div class="row"><span class="k">New subject code</span><span class="v">{_esc(se_code)}</span></div>'
+                f'<div class="row"><span class="k">Email</span><span class="v">{_esc(email.strip())}</span></div>'
+                '<div class="warn">Send this code to the subject. They enter it in the app to share their data with you.</div>'
+                + _mailto_button(email.strip(), "Your Vagis enrollment code", mail_body, "Email this subject")
+                + '</div>'
+            )
+            page = _portal_dashboard(r, key, cur, banner)
+    finally:
+        conn.close()
+    return HTMLResponse(page)
+
+
+@app.post("/portal/ui/subject", response_class=HTMLResponse)
+def portal_subject(rp_code: str = Form(""), key: str = Form(""), se_code: str = Form("")) -> HTMLResponse:
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            r = _auth_or_login(cur, rp_code, key)
+            if not r:
+                return HTMLResponse(_portal_login('<div class="err">Wrong Researcher ID or Key.</div>'))
+            se = (se_code or "").strip().upper()
+            # Verify this subject belongs to the signed-in researcher.
+            cur.execute("SELECT rp_code, label FROM subjects WHERE se_code = %s;", (se,))
+            row = cur.fetchone()
+            if not row or row[0] != r["rp_code"]:
+                return HTMLResponse(_portal_login('<div class="err">Subject not found under your account.</div>'))
+            label = row[1]
+            cur.execute("SELECT mode, row_count, uploaded_at FROM metric_uploads "
+                        "WHERE enrollment_code = %s ORDER BY mode;", (se,))
+            uploads = cur.fetchall()
+
+            if uploads:
+                items = ""
+                for mode, rc, up in uploads:
+                    up_s = up.isoformat()[:16].replace("T", " ") if up else ""
+                    items += (
+                        f'<div class="subrow"><div><b>{_esc(_mode_label(mode))}</b>'
+                        f'<div class="muted">{rc if rc is not None else "?"} sessions &middot; updated {up_s}</div></div>'
+                        f'<form class="inline" method="post" action="/portal/ui/view">'
+                        f'{_hidden_creds(r["rp_code"], key)}'
+                        f'<input type="hidden" name="se_code" value="{_esc(se)}">'
+                        f'<input type="hidden" name="mode" value="{_esc(mode)}">'
+                        f'<button class="small" type="submit">Open</button></form></div>'
+                    )
+                modes_block = items
+            else:
+                modes_block = '<p class="muted">This subject has not shared any data yet.</p>'
+
+            back = (f'<form class="inline" method="post" action="/portal/ui/dashboard">'
+                    f'{_hidden_creds(r["rp_code"], key)}'
+                    f'<button class="backbtn" type="submit">&larr; Back to subjects</button></form>')
+
+            page = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Subject {_esc(se)}</title>{_portal_style()}</head><body>
+  <h1>Subject <span class="mono">{_esc(se)}</span></h1>
+  <p class="sub">{_esc(label) if label else "No label"} &middot; researcher {_esc(r["rp_code"])}</p>
+  {back}
+  <div class="card"><h2>Shared data</h2>{modes_block}</div>
+</body></html>"""
+    finally:
+        conn.close()
+    return HTMLResponse(page)
+
+
+@app.post("/portal/ui/view", response_class=HTMLResponse)
+def portal_view(rp_code: str = Form(""), key: str = Form(""),
+                se_code: str = Form(""), mode: str = Form("")) -> HTMLResponse:
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            r = _auth_or_login(cur, rp_code, key)
+            if not r:
+                return HTMLResponse(_portal_login('<div class="err">Wrong Researcher ID or Key.</div>'))
+            se = (se_code or "").strip().upper()
+            md = (mode or "").strip().lower()
+            # Ownership check again (never trust the posted se_code alone).
+            cur.execute("SELECT rp_code FROM subjects WHERE se_code = %s;", (se,))
+            own = cur.fetchone()
+            if not own or own[0] != r["rp_code"]:
+                return HTMLResponse(_portal_login('<div class="err">Subject not found under your account.</div>'))
+            cur.execute("SELECT csv_text FROM metric_uploads WHERE enrollment_code = %s AND mode = %s;", (se, md))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    back = (f'<form class="inline" method="post" action="/portal/ui/subject">'
+            f'{_hidden_creds(rp_code, key)}'
+            f'<input type="hidden" name="se_code" value="{_esc(se)}">'
+            f'<button class="backbtn" type="submit">&larr; Back to subject</button></form>')
+
+    if not row:
+        table = '<p class="muted">No data for this mode.</p>'
+    else:
+        reader = _csv.reader(_io.StringIO(row[0]))
+        all_rows = list(reader)
+        if not all_rows:
+            table = '<p class="muted">File is empty.</p>'
+        else:
+            header = all_rows[0]
+            body_rows = all_rows[1:]
+            thead = "<tr>" + "".join(f"<th>{_esc(h)}</th>" for h in header) + "</tr>"
+            tbody = ""
+            for tr in body_rows:
+                tbody += "<tr>" + "".join(f'<td class="mono">{_esc(c)}</td>' for c in tr) + "</tr>"
+            table = (f'<p class="muted">{len(body_rows)} sessions &middot; {len(header)} metrics &middot; view only</p>'
+                     f'<div class="tablewrap"><table><thead>{thead}</thead><tbody>{tbody}</tbody></table></div>')
+
+    page = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_esc(_mode_label(md))} &middot; {_esc(se)}</title>{_portal_style()}</head><body>
+  <h1>{_esc(_mode_label(md))} data</h1>
+  <p class="sub">Subject <span class="mono">{_esc(se)}</span></p>
+  {back}
+  <div class="card">{table}</div>
+</body></html>"""
+    return HTMLResponse(page)
