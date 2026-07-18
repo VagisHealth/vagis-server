@@ -666,16 +666,15 @@ def validate_subject(
 
 
 # --------------------------------------------------------------------------
-# Admin page  (private single-screen tool: create a researcher, see the list)
+# Admin page  (private tool, NO JavaScript -- plain HTML forms that POST)
 # --------------------------------------------------------------------------
-# Served at GET /admin. The page holds no secret itself -- every action requires
-# you to paste your admin token, which is used only to call the /admin/* API.
-ADMIN_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Vagis Admin</title>
+# GET  /admin              -> the page (token + create form + list form)
+# POST /admin/ui/create    -> creates a researcher, shows the result page
+# POST /admin/ui/list      -> shows the researcher list page
+# The admin token is a normal form field; the server checks it. Because these are
+# real <form> submits, they work even if the browser blocks scripts.
+def _admin_style() -> str:
+    return """
 <style>
   * { box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -690,130 +689,128 @@ ADMIN_HTML = """<!DOCTYPE html>
   button { margin-top: 16px; padding: 10px 18px; font-size: 15px; font-weight: 500; color: #fff;
            background: #0f6e56; border: none; border-radius: 8px; cursor: pointer; }
   button.secondary { background: #444; }
-  button:disabled { opacity: .5; cursor: default; }
-  .result { margin-top: 16px; padding: 16px; border-radius: 8px; background: #e1f5ee;
-            border: 1px solid #9fe1cb; display: none; }
-  .result.show { display: block; }
-  .result .row { display: flex; justify-content: space-between; align-items: center;
-                 padding: 6px 0; font-size: 15px; }
+  .result { margin: 0 0 20px; padding: 16px; border-radius: 8px; background: #e1f5ee; border: 1px solid #9fe1cb; }
+  .result .row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 15px; }
   .result .k { color: #085041; font-weight: 500; }
-  .result .v { font-family: ui-monospace, Menlo, monospace; font-size: 15px; }
+  .result .v { font-family: ui-monospace, Menlo, monospace; font-size: 16px; }
   .warn { color: #854f0b; font-size: 13px; margin-top: 10px; }
-  .copybtn { margin: 0 0 0 10px; padding: 4px 10px; font-size: 12px; background: #085041; }
+  .err { margin: 0 0 20px; padding: 16px; border-radius: 8px; background: #fcebeb; border: 1px solid #f7c1c1; color: #a32d2d; }
   table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 14px; }
   th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #eee; }
   th { color: #666; font-weight: 500; font-size: 12px; text-transform: uppercase; }
   td.mono { font-family: ui-monospace, Menlo, monospace; }
-  .err { color: #a32d2d; font-size: 14px; margin-top: 10px; }
   .muted { color: #999; font-size: 13px; }
+  a.back { display: inline-block; margin-top: 8px; color: #0f6e56; font-size: 14px; }
 </style>
-</head>
+"""
+
+
+def _admin_page(token: str = "", banner: str = "") -> str:
+    tok_val = (token or "").replace('"', "&quot;")
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vagis Admin</title>{_admin_style()}</head>
 <body>
   <h1>Vagis Admin</h1>
   <p class="sub">Create researcher accounts and view the list. Private tool.</p>
-
-  <div class="card">
-    <h2>Your admin token</h2>
-    <input id="token" type="password" placeholder="Paste your VAGIS_ADMIN_TOKEN here" autocomplete="off">
-    <p class="muted">Entered once per visit. Never stored on this page.</p>
-  </div>
-
+  {banner}
   <div class="card">
     <h2>Create a researcher</h2>
-    <label>Name (optional)</label>
-    <input id="name" type="text" placeholder="Dr. Jane Smith">
-    <label>Email (optional)</label>
-    <input id="email" type="text" placeholder="jane@example.com">
-    <button id="createBtn" onclick="createResearcher()">Create researcher</button>
-    <div id="result" class="result"></div>
-    <div id="createErr" class="err"></div>
+    <form method="post" action="/admin/ui/create">
+      <label>Admin token</label>
+      <input name="token" type="password" placeholder="Paste your VAGIS_ADMIN_TOKEN" value="{tok_val}" autocomplete="off">
+      <label>Name (optional)</label>
+      <input name="name" type="text" placeholder="Dr. Jane Smith">
+      <label>Email (optional)</label>
+      <input name="email" type="text" placeholder="jane@example.com">
+      <button type="submit">Create researcher</button>
+    </form>
   </div>
-
   <div class="card">
     <h2>Researchers</h2>
-    <button class="secondary" onclick="loadResearchers()">Refresh list</button>
-    <div id="listErr" class="err"></div>
-    <table id="table" style="display:none">
-      <thead><tr><th>RP code</th><th>Name</th><th>Email</th><th>Subjects</th><th>Created</th></tr></thead>
-      <tbody id="tbody"></tbody>
-    </table>
-    <p id="empty" class="muted" style="display:none">No researchers yet.</p>
+    <form method="post" action="/admin/ui/list">
+      <label>Admin token</label>
+      <input name="token" type="password" placeholder="Paste your VAGIS_ADMIN_TOKEN" value="{tok_val}" autocomplete="off">
+      <button type="submit" class="secondary">Show list</button>
+    </form>
   </div>
-
-<script>
-function tok() { return document.getElementById('token').value.trim(); }
-function hdr() { return { 'Authorization': 'Bearer ' + tok(), 'Content-Type': 'application/json' }; }
-
-function copy(text, btn) {
-  navigator.clipboard.writeText(text).then(function(){ btn.textContent = 'Copied'; setTimeout(function(){ btn.textContent = 'Copy'; }, 1200); });
-}
-
-async function createResearcher() {
-  var errEl = document.getElementById('createErr');
-  var resEl = document.getElementById('result');
-  errEl.textContent = ''; resEl.className = 'result';
-  if (!tok()) { errEl.textContent = 'Enter your admin token first.'; return; }
-  var btn = document.getElementById('createBtn');
-  btn.disabled = true; btn.textContent = 'Creating...';
-  try {
-    var r = await fetch('/admin/researchers', {
-      method: 'POST', headers: hdr(),
-      body: JSON.stringify({ name: document.getElementById('name').value, email: document.getElementById('email').value })
-    });
-    var d = await r.json();
-    if (!r.ok) { errEl.textContent = 'Error: ' + (d.detail || r.status); return; }
-    resEl.innerHTML =
-      '<div class="row"><span class="k">Researcher code (RP)</span>' +
-      '<span><span class="v">' + d.rp_code + '</span>' +
-      '<button class="copybtn" onclick="copy(\'' + d.rp_code + '\', this)">Copy</button></span></div>' +
-      '<div class="row"><span class="k">Secret</span>' +
-      '<span><span class="v">' + d.secret + '</span>' +
-      '<button class="copybtn" onclick="copy(\'' + d.secret + '\', this)">Copy</button></span></div>' +
-      '<div class="warn">Email BOTH to the researcher. The secret is how they log in and issue subject codes. Save it now &mdash; the list below never shows secrets again.</div>';
-    resEl.className = 'result show';
-    document.getElementById('name').value = '';
-    document.getElementById('email').value = '';
-    loadResearchers();
-  } catch (e) {
-    errEl.textContent = 'Network error: ' + e.message;
-  } finally {
-    btn.disabled = false; btn.textContent = 'Create researcher';
-  }
-}
-
-async function loadResearchers() {
-  var errEl = document.getElementById('listErr');
-  errEl.textContent = '';
-  if (!tok()) { errEl.textContent = 'Enter your admin token first.'; return; }
-  try {
-    var r = await fetch('/admin/researchers', { headers: hdr() });
-    var d = await r.json();
-    if (!r.ok) { errEl.textContent = 'Error: ' + (d.detail || r.status); return; }
-    var tb = document.getElementById('tbody');
-    tb.innerHTML = '';
-    if (!d.items || d.items.length === 0) {
-      document.getElementById('table').style.display = 'none';
-      document.getElementById('empty').style.display = 'block';
-      return;
-    }
-    document.getElementById('empty').style.display = 'none';
-    document.getElementById('table').style.display = 'table';
-    d.items.forEach(function(it) {
-      var created = it.created_at ? it.created_at.slice(0, 10) : '';
-      tb.innerHTML += '<tr><td class="mono">' + it.rp_code + '</td><td>' +
-        (it.name || '') + '</td><td>' + (it.email || '') + '</td><td>' +
-        it.subjects + '</td><td>' + created + '</td></tr>';
-    });
-  } catch (e) {
-    errEl.textContent = 'Network error: ' + e.message;
-  }
-}
-</script>
-</body>
-</html>"""
+</body></html>"""
 
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page() -> HTMLResponse:
-    """Private single-screen admin tool. Actions require the admin token."""
-    return HTMLResponse(content=ADMIN_HTML)
+    return HTMLResponse(_admin_page())
+
+
+@app.post("/admin/ui/create", response_class=HTMLResponse)
+def admin_ui_create(
+    token: str = Form(""),
+    name: str = Form(""),
+    email: str = Form(""),
+) -> HTMLResponse:
+    # Trim whitespace so a stray space in the token never blocks you.
+    if token.strip() != (VAGIS_ADMIN_TOKEN or "").strip() or not VAGIS_ADMIN_TOKEN:
+        banner = '<div class="err">Admin token did not match. Check it and try again.</div>'
+        return HTMLResponse(_admin_page(token, banner))
+
+    secret = secrets.token_urlsafe(24)
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            cur.execute("SELECT COALESCE(MAX(rp_seq), 0) FROM researchers;")
+            next_seq = cur.fetchone()[0] + 1
+            if next_seq > 999:
+                return HTMLResponse(_admin_page(token, '<div class="err">RP capacity reached (999).</div>'))
+            rp_code = make_rp_code(next_seq)
+            cur.execute(
+                "INSERT INTO researchers (rp_code, rp_seq, name, email, secret) VALUES (%s,%s,%s,%s,%s);",
+                (rp_code, next_seq, name or None, email or None, secret),
+            )
+    finally:
+        conn.close()
+
+    banner = (
+        '<div class="result">'
+        f'<div class="row"><span class="k">Researcher code (RP)</span><span class="v">{rp_code}</span></div>'
+        f'<div class="row"><span class="k">Secret</span><span class="v">{secret}</span></div>'
+        '<div class="warn">Email BOTH to the researcher and save them now &mdash; '
+        'the list never shows the secret again.</div></div>'
+    )
+    return HTMLResponse(_admin_page(token, banner))
+
+
+@app.post("/admin/ui/list", response_class=HTMLResponse)
+def admin_ui_list(token: str = Form("")) -> HTMLResponse:
+    if token.strip() != (VAGIS_ADMIN_TOKEN or "").strip() or not VAGIS_ADMIN_TOKEN:
+        return HTMLResponse(_admin_page(token, '<div class="err">Admin token did not match.</div>'))
+
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            cur.execute(
+                "SELECT r.rp_code, r.name, r.email, r.created_at, "
+                "(SELECT COUNT(*) FROM subjects s WHERE s.rp_code = r.rp_code) "
+                "FROM researchers r ORDER BY r.rp_seq;"
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        table = '<p class="muted">No researchers yet.</p>'
+    else:
+        body = "".join(
+            f'<tr><td class="mono">{r[0]}</td><td>{r[1] or ""}</td><td>{r[2] or ""}</td>'
+            f'<td>{r[4]}</td><td>{r[3].isoformat()[:10] if r[3] else ""}</td></tr>'
+            for r in rows
+        )
+        table = (
+            '<table><thead><tr><th>RP code</th><th>Name</th><th>Email</th>'
+            '<th>Subjects</th><th>Created</th></tr></thead><tbody>' + body + '</tbody></table>'
+        )
+    banner = f'<div class="card"><h2>Researchers ({len(rows)})</h2>{table}' \
+             f'<a class="back" href="/admin">&larr; Back</a></div>'
+    return HTMLResponse(_admin_page(token, banner))
