@@ -909,6 +909,9 @@ def _research_style() -> str:
   .issue input { border:0.5px solid #e2e6ea; border-radius:6px; padding:6px 8px; font-size:12px; }
   .issue button { background:#1d6fa5;color:#fff;border:none;border-radius:6px;padding:7px 11px;font-size:12px;cursor:pointer; }
   .hint { font-size:10px;color:#93a0a8;margin-top:6px;text-align:center; }
+  .modebox { margin-top:0; }
+  .modebox select { width:100%; border:0.5px solid #e2e6ea; border-radius:6px; padding:7px 8px;
+                    font-size:12px; background:#fff; color:#2c3940; }
   .overlay { position:fixed; inset:0; background:rgba(20,30,40,.28); display:none;
              align-items:flex-start; justify-content:center; padding-top:40px; z-index:50; }
   .overlay.show { display:flex; }
@@ -983,6 +986,15 @@ _RESEARCH_BODY = r"""
           <span class="btns"><button class="minibtn" onclick="addSel('group2')">&rarr;</button>
           <button class="minibtn" onclick="clearBox('group2')">clear</button></span></div>
         <div class="groupbody" id="group2" data-box="group2" tabindex="0"></div>
+      </div>
+      <div class="card modebox">
+        <div class="lbl">Group comparison mode</div>
+        <select id="modeSelect">
+          <option value="sleep">Sleep</option>
+          <option value="rest">Rest</option>
+          <option value="stand">Stand</option>
+          <option value="breathwork">Breathwork</option>
+        </select>
       </div>
     </div>
 
@@ -1155,7 +1167,8 @@ async function send() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ provider_code: PROVIDER, key: KEY, message: msg,
-                             history: conversation, groups: groupsPayload() })
+                             history: conversation, groups: groupsPayload(),
+                             mode: document.getElementById('modeSelect').value })
     });
     const data = await res.json();
     thinking.remove();
@@ -1486,9 +1499,101 @@ class AgentChatRequest(BaseModel):
     message: str
     history: list[dict[str, Any]] = Field(default_factory=list)
     groups: dict[str, list[str]] = Field(default_factory=dict)
+    mode: str = ""            # group-comparison mode (sleep/rest/stand/breathwork)
 
 
-def _research_agent_system(groups: dict[str, list[str]]) -> str:
+# Rough budget for how much subject data to hand the agent as raw rows before
+# falling back to computed summaries. ~4 chars/token; keep well under context.
+DATA_CHAR_BUDGET = 220_000
+RESEARCH_MODES = ["sleep", "rest", "stand", "breathwork"]
+
+
+def _fetch_csv(cur, person_code: str, mode: str) -> Optional[str]:
+    cur.execute("SELECT csv_text FROM research_uploads WHERE person_code=%s AND mode=%s;",
+                (person_code, mode))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _summarize_csv(csv_text: str) -> str:
+    """Compact per-column summary (n, mean, sd, min, max) for numeric columns —
+    the graceful fallback when raw rows exceed the budget."""
+    import csv as _csv, io as _io, math
+    reader = list(_csv.reader(_io.StringIO(csv_text)))
+    if len(reader) < 2:
+        return "(no data rows)"
+    header, rows = reader[0], reader[1:]
+    lines = [f"n_sessions={len(rows)}"]
+    for ci, col in enumerate(header):
+        vals = []
+        for r in rows:
+            if ci < len(r):
+                try:
+                    vals.append(float(r[ci]))
+                except (ValueError, TypeError):
+                    pass
+        if len(vals) >= 2:
+            mean = sum(vals) / len(vals)
+            sd = math.sqrt(sum((v - mean) ** 2 for v in vals) / (len(vals) - 1))
+            lines.append(f"{col}: n={len(vals)} mean={mean:.3g} sd={sd:.3g} "
+                         f"min={min(vals):.3g} max={max(vals):.3g}")
+    return "\n".join(lines)
+
+
+def _build_data_context(cur, groups: dict[str, list[str]], mode: str) -> tuple[str, bool]:
+    """Assemble the data block for the agent. Individual -> all 4 modes raw.
+    Groups -> the chosen mode raw for each subject. Falls back to summaries if
+    the raw payload would exceed DATA_CHAR_BUDGET. Returns (text, used_summaries)."""
+    ind = groups.get("individual", []) or []
+    g1 = groups.get("group1", []) or []
+    g2 = groups.get("group2", []) or []
+    mode = (mode or "").strip().lower()
+
+    # Gather raw pieces first, measure, then decide raw vs summary.
+    def subject_block(code: str, modes: list[str]) -> list[tuple[str, str, str]]:
+        out = []
+        for md in modes:
+            csv_text = _fetch_csv(cur, code, md)
+            if csv_text:
+                out.append((code, md, csv_text))
+        return out
+
+    pieces: list[tuple[str, str, str]] = []  # (code, mode, csv_text)
+    if ind:
+        for code in ind:
+            pieces += subject_block(code, RESEARCH_MODES)
+    if (g1 or g2):
+        cmp_modes = [mode] if mode in RESEARCH_MODES else []
+        if cmp_modes:
+            for code in g1 + g2:
+                pieces += subject_block(code, cmp_modes)
+
+    if not pieces:
+        return ("", False)
+
+    total_chars = sum(len(c) for _, _, c in pieces)
+    use_summary = total_chars > DATA_CHAR_BUDGET
+
+    sections = []
+    def label(code: str) -> str:
+        where = []
+        if code in ind: where.append("Individual")
+        if code in g1:  where.append("Group 1")
+        if code in g2:  where.append("Group 2")
+        return f"{code} [{', '.join(where)}]" if where else code
+
+    for code, md, csv_text in pieces:
+        body = _summarize_csv(csv_text) if use_summary else csv_text.strip()
+        kind = "summary" if use_summary else "raw CSV"
+        sections.append(f"--- {label(code)} · {md} · {kind} ---\n{body}")
+
+    header = ("SUBJECT DATA (summaries — full raw data exceeded the size budget)"
+              if use_summary else "SUBJECT DATA (raw session rows)")
+    return (header + "\n\n" + "\n\n".join(sections), use_summary)
+
+
+def _research_agent_system(groups: dict[str, list[str]], mode: str,
+                           data_block: str, used_summary: bool) -> str:
     ind = groups.get("individual", []) or []
     g1 = groups.get("group1", []) or []
     g2 = groups.get("group2", []) or []
@@ -1496,43 +1601,67 @@ def _research_agent_system(groups: dict[str, list[str]]) -> str:
     if ind: sel.append(f"Individual: {', '.join(ind)}")
     if g1:  sel.append(f"Group 1: {', '.join(g1)}")
     if g2:  sel.append(f"Group 2: {', '.join(g2)}")
+    if (g1 or g2) and mode:
+        sel.append(f"Group comparison mode: {mode}")
     sel_block = "\n".join(sel) if sel else "No subjects are selected yet."
-    return (
+
+    base = (
         "You are the Vagis research analysis assistant, helping a researcher analyze "
         "autonomic-metric data collected from study subjects via a smart ring. You speak "
-        "to a professional researcher, so you can be technical and precise.\n\n"
-        "IMPORTANT — current capability: this is an early preview. You can discuss study "
-        "design, explain which statistical tests fit a question, and describe what analysis "
-        "you would run. But you do NOT yet have the subjects' actual data loaded, and you "
-        "cannot yet execute code or compute real statistics or figures. If asked to run a "
-        "specific test, briefly say what you would do and note that live data-connected "
-        "analysis is being added next — do NOT fabricate numbers, p-values, or results.\n\n"
+        "to a professional researcher, so be technical and precise.\n\n"
         "The researcher has currently selected:\n" + sel_block + "\n\n"
-        "The researcher is responsible for which subject codes belong to which group. "
-        "Keep replies concise and useful."
+        "The researcher is responsible for which subject codes belong to which group.\n\n"
     )
+
+    if data_block:
+        cap = (
+            "The selected subjects' data is provided below. For an Individual, all four "
+            "recording modes are included; for a group comparison, the chosen mode is "
+            "included for every subject.\n\n"
+            "IMPORTANT — how to use it: you can read and reason over this data to describe "
+            "patterns, differences, and trends, and give approximate figures. But you are "
+            "READING numbers, not executing code, so do NOT present precise statistics, "
+            "p-values, or exact test results as if computed — approximate and clearly say so. "
+            "Formal computed tests and publication figures are being added next (they will "
+            "run real code). Never fabricate values that aren't supported by the data shown.\n"
+        )
+        if used_summary:
+            cap += ("\nNote: the raw data was large, so per-column SUMMARIES (n, mean, sd, "
+                    "min, max) are shown instead of raw rows for this request.\n")
+        return base + cap + "\n" + data_block
+    else:
+        return base + (
+            "No subject data is loaded for this request (nothing selected, or the selected "
+            "subjects have no uploaded data for the chosen mode). You can still discuss study "
+            "design and which tests would fit — but do NOT fabricate numbers or results."
+        )
 
 
 @app.post("/portal/agent/chat")
 def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
     """Live agent pipe for the research portal. Authenticated by provider_code+key.
-    Stage 1: real Claude reply, no data/code-execution yet."""
+    Stage 2: the selected subjects' real data is loaded into the agent's context
+    (individual = all modes; group comparison = the chosen mode). No code execution yet."""
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=500, detail="Anthropic key not configured.")
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="Empty message.")
+
     conn = db_connect()
     try:
         with conn, conn.cursor() as cur:
             ensure_tables(cur)
             prov = authenticate_provider(cur, req.provider_code, req.key)
+            if not prov or prov["kind"] != "research":
+                raise HTTPException(status_code=401, detail="Not authorized for the research agent.")
+            # Only fetch data for subjects that actually belong to this provider.
+            owned = _owned_selection(cur, prov["provider_code"], req.groups)
+            data_block, used_summary = _build_data_context(cur, owned, req.mode)
     finally:
         conn.close()
-    if not prov or prov["kind"] != "research":
-        raise HTTPException(status_code=401, detail="Not authorized for the research agent.")
 
-    if not req.message.strip():
-        raise HTTPException(status_code=400, detail="Empty message.")
+    system = _research_agent_system(owned, req.mode, data_block, used_summary)
 
-    # Build conversation from history (already includes the latest user turn).
     messages = []
     for turn in req.history[-20:]:
         role = turn.get("role")
@@ -1546,7 +1675,7 @@ def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
         m = client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
-            system=_research_agent_system(req.groups),
+            system=system,
             messages=messages,
         )
     except anthropic.APIStatusError as e:
@@ -1556,3 +1685,16 @@ def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
 
     reply = "".join(b.text for b in m.content if getattr(b, "type", None) == "text").strip()
     return {"reply": reply or "(no reply)"}
+
+
+def _owned_selection(cur, provider_code: str, groups: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Filter the selected codes down to subjects that truly belong to this provider,
+    so a tampered request can't pull another researcher's data."""
+    cur.execute("SELECT person_code FROM persons WHERE provider_code=%s AND kind='research';",
+                (provider_code,))
+    mine = {r[0] for r in cur.fetchall()}
+    out = {}
+    for box in ("individual", "group1", "group2"):
+        codes = [c.strip().upper() for c in (groups.get(box) or [])]
+        out[box] = [c for c in codes if c in mine]
+    return out
