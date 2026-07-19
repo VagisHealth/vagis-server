@@ -856,16 +856,20 @@ def _research_style() -> str:
   .banner { background:#e1f5ee;border:1px solid #9fe1cb;border-radius:9px;padding:12px 14px;margin-bottom:12px;
             font-size:14px;color:#085041; }
   .banner .v { font-family:ui-monospace,Menlo,monospace;font-weight:600; }
-  .grid { display:grid; grid-template-columns:130px 160px 1fr; gap:10px; align-items:start; }
+  .grid { display:grid; grid-template-columns:130px 160px 1fr; gap:10px; align-items:stretch; }
   .card { background:#fff; border:0.5px solid #e2e6ea; border-radius:10px; padding:11px; }
   .lbl { font-size:10px;font-weight:600;color:#5f6b72;text-transform:uppercase;letter-spacing:.3px;margin-bottom:8px; }
   .leftcol { display:flex; flex-direction:column; gap:10px; }
-  .subjlist { display:flex; flex-direction:column; gap:2px; max-height:560px; overflow-y:auto; }
+  .leftcol .subjcard { flex:1; display:flex; flex-direction:column; min-height:0; }
+  .subjlist { display:flex; flex-direction:column; gap:2px; flex:1; min-height:120px; overflow-y:auto; }
   .subj { font-family:ui-monospace,Menlo,monospace; font-size:11px; color:#3a4750;
           padding:4px 6px; border-radius:4px; cursor:pointer; user-select:none; }
   .subj:hover { background:#f0f4f7; }
   .subj.sel { background:#eef6fc; color:#12456e; font-weight:600; }
+  .midcol { display:flex; flex-direction:column; }
   .box { margin-bottom:9px; }
+  .box.grow { flex:1; display:flex; flex-direction:column; margin-bottom:9px; }
+  .box.grow:last-child { margin-bottom:0; }
   .box .hd { display:flex;align-items:center;justify-content:space-between;margin-bottom:6px; }
   .box .hd .name { font-size:11px;font-weight:600; }
   .box .hd .btns { display:flex;gap:4px; }
@@ -880,14 +884,17 @@ def _research_style() -> str:
   .g2 .chip { background:#f4faef; color:#2f5410; }
   .ind .chip { background:#f2f4f6; color:#2c3940; }
   .chip .rm { cursor:pointer; color:#c0392b; font-weight:700; margin-left:6px; }
-  .groupbody { min-height:172px; max-height:236px; overflow-y:auto; border:1px dashed #dfe4e9;
+  .groupbody { flex:1; min-height:90px; overflow-y:auto; border:1px dashed #dfe4e9;
                border-radius:6px; padding:6px; outline:none; }
   .groupbody:focus { border-color:#9fbdd8; }
   .groupbody:empty::before { content:"paste or add subjects"; font-size:10px; color:#b7c0c7; }
-  .drop-sm { min-height:26px; border:1px dashed #dfe4e9; border-radius:6px; padding:5px; outline:none; }
+  .drop-sm { min-height:24px; border:1px dashed #dfe4e9; border-radius:6px; padding:5px; outline:none; }
   .drop-sm:focus { border-color:#9fbdd8; }
+  .rosterbtn { width:100%; background:#fff; border:0.5px solid #cfe0ee; color:#1d6fa5;
+               border-radius:6px; padding:7px; font-size:12px; cursor:pointer; margin-bottom:8px; }
+  .rosterbtn:hover { background:#f4f9fd; }
   .agent { display:flex; flex-direction:column; min-height:560px; }
-  .msgs { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:9px; padding:2px; max-height:490px; }
+  .msgs { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:9px; padding:2px; }
   .msg { border-radius:9px; padding:10px 13px; font-size:13.5px; line-height:1.5; max-width:82%; white-space:pre-wrap; }
   .msg.user { background:#eef6fc; color:#12456e; align-self:flex-end; }
   .msg.bot { background:#f6f7f8; color:#2c3940; align-self:flex-start; }
@@ -902,6 +909,31 @@ def _research_style() -> str:
   .issue input { border:0.5px solid #e2e6ea; border-radius:6px; padding:6px 8px; font-size:12px; }
   .issue button { background:#1d6fa5;color:#fff;border:none;border-radius:6px;padding:7px 11px;font-size:12px;cursor:pointer; }
   .hint { font-size:10px;color:#93a0a8;margin-top:6px;text-align:center; }
+  .overlay { position:fixed; inset:0; background:rgba(20,30,40,.28); display:none;
+             align-items:flex-start; justify-content:center; padding-top:40px; z-index:50; }
+  .overlay.show { display:flex; }
+  .rosterpanel { background:#fff; border:0.5px solid #d8dee3; border-radius:12px; width:86%;
+                 max-width:640px; max-height:82vh; overflow:hidden; display:flex; flex-direction:column;
+                 box-shadow:0 8px 26px rgba(0,0,0,.16); }
+  .rosterhd { display:flex; align-items:center; justify-content:space-between; padding:13px 18px; border-bottom:0.5px solid #eceef1; }
+  .rosterhd .title { font-size:15px; font-weight:600; color:#1a2b34; }
+  .rosterhd .acts { display:flex; gap:8px; align-items:center; }
+  .rosterhd .prbtn { font-size:12px; color:#1d6fa5; border:0.5px solid #cfe0ee; background:#fff;
+                     border-radius:6px; padding:5px 11px; cursor:pointer; }
+  .rosterhd .clbtn { font-size:18px; color:#93a0a8; cursor:pointer; background:none; border:none; }
+  .rostermeta { font-size:11px; color:#5f6b72; padding:8px 18px 0; }
+  .rosterbody { overflow-y:auto; padding:6px 18px 16px; }
+  .rostertbl { width:100%; border-collapse:collapse; font-size:12.5px; }
+  .rostertbl th { text-align:left; font-size:10px; color:#5f6b72; text-transform:uppercase; letter-spacing:.3px;
+                  padding:9px 8px; border-bottom:1.5px solid #d5dbe0; position:sticky; top:0; background:#fff; }
+  .rostertbl td { padding:8px; border-top:0.5px solid #eceef1; color:#2c3940; }
+  .rostertbl td.mono { font-family:ui-monospace,Menlo,monospace; }
+  @media print {
+    body > .wrap { display:none !important; }
+    .overlay { position:static; background:none; display:block; padding:0; }
+    .rosterpanel { box-shadow:none; border:none; width:100%; max-width:100%; max-height:none; }
+    .rosterhd .acts { display:none; }
+  }
 </style>
 """
 
@@ -915,12 +947,13 @@ _RESEARCH_BODY = r"""
   <div class="grid">
 
     <div class="leftcol">
-      <div class="card">
+      <div class="card subjcard">
         <div class="lbl">Subjects</div>
         <div class="subjlist" id="subjlist"></div>
       </div>
       <div class="card addbox">
         <div class="lbl">Add subjects</div>
+        <button type="button" class="rosterbtn" onclick="openRoster()">View subject roster</button>
         <form method="post" action="/portal/ui/issue" class="issue" id="issueForm">
           <input type="hidden" name="provider_code" id="pcField">
           <input type="hidden" name="key" id="keyField">
@@ -931,7 +964,7 @@ _RESEARCH_BODY = r"""
       </div>
     </div>
 
-    <div>
+    <div class="midcol">
       <div class="card box ind">
         <div class="hd"><span class="name">Individual</span>
           <span class="btns"><button class="minibtn" onclick="addSel('individual')">&rarr;</button>
@@ -939,13 +972,13 @@ _RESEARCH_BODY = r"""
         <div id="individual"></div>
         <div class="drop drop-sm" data-box="individual" tabindex="0"></div>
       </div>
-      <div class="card box g1">
+      <div class="card box g1 grow">
         <div class="hd"><span class="name" style="color:#185fa5">Group 1</span>
           <span class="btns"><button class="minibtn" onclick="addSel('group1')">&rarr;</button>
           <button class="minibtn" onclick="clearBox('group1')">clear</button></span></div>
         <div class="groupbody" id="group1" data-box="group1" tabindex="0"></div>
       </div>
-      <div class="card box g2">
+      <div class="card box g2 grow">
         <div class="hd"><span class="name" style="color:#3b6d11">Group 2</span>
           <span class="btns"><button class="minibtn" onclick="addSel('group2')">&rarr;</button>
           <button class="minibtn" onclick="clearBox('group2')">clear</button></span></div>
@@ -963,6 +996,25 @@ _RESEARCH_BODY = r"""
       <div class="hint">Preview: the agent is connected. Live statistics and figures are being added next.</div>
     </div>
 
+  </div>
+</div>
+
+<div class="overlay" id="rosterOverlay" onclick="if(event.target===this)closeRoster()">
+  <div class="rosterpanel">
+    <div class="rosterhd">
+      <span class="title" id="rosterTitle">Subject roster</span>
+      <span class="acts">
+        <button class="prbtn" onclick="window.print()">Print</button>
+        <button class="clbtn" onclick="closeRoster()">&times;</button>
+      </span>
+    </div>
+    <div class="rostermeta" id="rosterMeta"></div>
+    <div class="rosterbody">
+      <table class="rostertbl">
+        <thead><tr><th>SE code</th><th>Email</th><th>Label</th><th>Enrolled</th></tr></thead>
+        <tbody id="rosterRows"></tbody>
+      </table>
+    </div>
   </div>
 </div>
 
@@ -1058,6 +1110,26 @@ function groupsPayload() {
   return { individual: boxes.individual.slice(), group1: boxes.group1.slice(), group2: boxes.group2.slice() };
 }
 
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }); }
+
+function openRoster() {
+  const rows = document.getElementById('rosterRows');
+  rows.innerHTML = '';
+  SUBJECTS.forEach(function(s) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td class="mono">' + esc(s.code) + '</td><td>' + esc(s.email || '\u2014') +
+                   '</td><td>' + esc(s.label || '\u2014') + '</td><td>' + esc(s.enrolled || '\u2014') + '</td>';
+    rows.appendChild(tr);
+  });
+  const today = new Date().toISOString().slice(0, 10);
+  document.getElementById('rosterTitle').textContent = 'Subject roster \u00b7 ' + SUBJECTS.length + ' subjects';
+  document.getElementById('rosterMeta').textContent =
+    PROVIDER + (PROVNAME ? ' \u00b7 ' + PROVNAME : '') + ' \u00b7 generated ' + today;
+  document.getElementById('rosterOverlay').classList.add('show');
+}
+
+function closeRoster() { document.getElementById('rosterOverlay').classList.remove('show'); }
+
 function addMsg(role, text, cls) {
   const m = document.createElement('div');
   m.className = 'msg ' + (cls || role);
@@ -1111,10 +1183,12 @@ def _research_dashboard(prov: dict, key: str, cur, banner: str = "") -> str:
     """Rich research analysis workspace: thin subject list, Individual/Group1/Group2
     boxes with click-to-add + paste, and a live agent chat panel."""
     import json as _json
-    cur.execute("SELECT person_code, label FROM persons WHERE provider_code = %s AND kind='research' "
-                "ORDER BY person_seq;", (prov["provider_code"],))
+    cur.execute("SELECT person_code, label, email, created_at FROM persons "
+                "WHERE provider_code = %s AND kind='research' ORDER BY person_seq;",
+                (prov["provider_code"],))
     rows = cur.fetchall()
-    subjects = [{"code": r[0], "label": r[1] or ""} for r in rows]
+    subjects = [{"code": r[0], "label": r[1] or "", "email": r[2] or "",
+                 "enrolled": r[3].isoformat()[:10] if r[3] else ""} for r in rows]
     subjects_json = _json.dumps(subjects)
     prov_code = prov["provider_code"]
     name = prov.get("name") or ""
