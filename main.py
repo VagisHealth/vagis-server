@@ -1217,6 +1217,11 @@ async function send() {
   addMsg('user', msg);
   conversation.push({ role: 'user', content: msg });
   const thinking = addMsg('bot', 'Analyzing...', 'bot think');
+  let secs = 0;
+  const ticker = setInterval(function(){
+    secs += 5;
+    thinking.textContent = 'Analyzing... (' + secs + 's — larger analyses can take a minute or two)';
+  }, 5000);
   try {
     const res = await fetch('/portal/agent/chat', {
       method: 'POST',
@@ -1226,7 +1231,7 @@ async function send() {
                              mode: document.getElementById('modeSelect').value })
     });
     const data = await res.json();
-    thinking.remove();
+    clearInterval(ticker); thinking.remove();
     const reply = (data && data.reply) ? data.reply : (data && data.detail ? data.detail : 'No response.');
     addMsg('bot', reply);
     conversation.push({ role: 'assistant', content: reply });
@@ -1234,7 +1239,7 @@ async function send() {
     figs.forEach(addFigure);
     if (figs.length) addSummaryButton(reply, figs);
   } catch (e) {
-    thinking.remove();
+    clearInterval(ticker); thinking.remove();
     addMsg('bot', 'Could not reach the agent: ' + e.message);
   } finally {
     btn.disabled = false;
@@ -1772,14 +1777,15 @@ def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
     text_parts: list[str] = []
 
     # Tool-use loop: code execution runs server-side on Anthropic's side; we may
-    # need to continue the turn on a pause_turn stop reason.
+    # need to continue the turn on a pause_turn stop reason. Each call carries an
+    # explicit timeout so a stuck turn returns an error instead of hanging forever.
     try:
         for _ in range(8):  # safety bound on turn continuations
             kwargs = dict(model=MODEL, max_tokens=AGENT_MAX_TOKENS,
                           system=system, messages=messages, tools=[CODE_EXEC_TOOL])
             if container_id:
                 kwargs["container"] = container_id
-            m = client.messages.create(**kwargs)
+            m = client.with_options(timeout=170.0).messages.create(**kwargs)
 
             if getattr(m, "container", None):
                 container_id = m.container.id
@@ -1789,10 +1795,18 @@ def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
                 text_parts.append(t)
 
             if getattr(m, "stop_reason", None) == "pause_turn":
-                # Feed the paused turn back to let the agent continue.
+                # Feed the paused assistant turn back verbatim to continue it.
                 messages.append({"role": "assistant", "content": m.content})
                 continue
             break
+    except anthropic.APITimeoutError:
+        partial = "\n\n".join(p for p in text_parts if p).strip()
+        note = ("The analysis is taking longer than expected and timed out. This can "
+                "happen with larger multi-step analyses. Please try again, or ask for a "
+                "more specific single test (e.g. name the exact metric and test).")
+        reply = (partial + "\n\n" + note) if partial else note
+        return {"reply": reply, "figures": figure_ids,
+                "container": container_id, "has_analysis": bool(figure_ids), "timed_out": True}
     except anthropic.APIStatusError as e:
         raise HTTPException(status_code=502, detail=f"Anthropic error: {e.status_code}")
     except Exception as e:
