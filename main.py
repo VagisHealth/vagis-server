@@ -1723,7 +1723,7 @@ def _research_agent_system(groups: dict[str, list[str]], mode: str,
 
 
 CODE_EXEC_TOOL = {"type": "code_execution_20250825", "name": "code_execution"}
-AGENT_MAX_TOKENS = int(os.environ.get("VAGIS_AGENT_MAX_TOKENS", "4096"))
+AGENT_MAX_TOKENS = int(os.environ.get("VAGIS_AGENT_MAX_TOKENS", "16000"))
 
 
 def _extract_text(content) -> str:
@@ -1788,6 +1788,7 @@ def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
     # that is still working reports stop_reason "pause_turn" or "tool_use"; we feed
     # the assistant turn back and continue until it reaches a final stop reason and
     # produces its closing text. Each call carries a timeout so nothing hangs.
+    hit_token_limit = False
     try:
         for _i in range(10):  # safety bound on continuations
             kwargs = dict(model=MODEL, max_tokens=AGENT_MAX_TOKENS,
@@ -1813,6 +1814,9 @@ def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
             if t:
                 text_parts.append(t)
 
+            if getattr(m, "stop_reason", None) == "max_tokens":
+                hit_token_limit = True
+                break
             if getattr(m, "stop_reason", None) in CONTINUE_REASONS:
                 # Feed the assistant turn back verbatim so it can continue.
                 messages.append({"role": "assistant", "content": m.content})
@@ -1833,10 +1837,15 @@ def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
 
     reply = "\n\n".join(p for p in text_parts if p).strip()
     if not reply:
-        # Work may have happened (figures) but no closing text came through.
-        reply = ("The analysis ran but didn't return a written summary. "
-                 "Please try again, or rephrase the request more specifically."
-                 if figure_ids else "(no reply)")
+        if hit_token_limit:
+            reply = ("The analysis was too large to complete in one response. Please ask for "
+                     "a more focused analysis — for example, one specific metric and one test "
+                     "at a time.")
+        elif figure_ids:
+            reply = ("The analysis ran but didn't return a written summary. "
+                     "Please try again, or rephrase the request more specifically.")
+        else:
+            reply = "(no reply)"
     return {"reply": reply, "figures": figure_ids,
             "container": container_id, "has_analysis": bool(figure_ids)}
 
