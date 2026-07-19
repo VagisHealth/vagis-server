@@ -856,10 +856,11 @@ def _research_style() -> str:
   .banner { background:#e1f5ee;border:1px solid #9fe1cb;border-radius:9px;padding:12px 14px;margin-bottom:12px;
             font-size:14px;color:#085041; }
   .banner .v { font-family:ui-monospace,Menlo,monospace;font-weight:600; }
-  .grid { display:grid; grid-template-columns:120px 150px 1fr; gap:10px; align-items:start; }
+  .grid { display:grid; grid-template-columns:130px 160px 1fr; gap:10px; align-items:start; }
   .card { background:#fff; border:0.5px solid #e2e6ea; border-radius:10px; padding:11px; }
   .lbl { font-size:10px;font-weight:600;color:#5f6b72;text-transform:uppercase;letter-spacing:.3px;margin-bottom:8px; }
-  .subjlist { display:flex; flex-direction:column; gap:2px; max-height:520px; overflow-y:auto; }
+  .leftcol { display:flex; flex-direction:column; gap:10px; }
+  .subjlist { display:flex; flex-direction:column; gap:2px; max-height:560px; overflow-y:auto; }
   .subj { font-family:ui-monospace,Menlo,monospace; font-size:11px; color:#3a4750;
           padding:4px 6px; border-radius:4px; cursor:pointer; user-select:none; }
   .subj:hover { background:#f0f4f7; }
@@ -879,10 +880,14 @@ def _research_style() -> str:
   .g2 .chip { background:#f4faef; color:#2f5410; }
   .ind .chip { background:#f2f4f6; color:#2c3940; }
   .chip .rm { cursor:pointer; color:#c0392b; font-weight:700; margin-left:6px; }
-  .drop { border:1px dashed #d5dbe0; border-radius:5px; padding:6px; text-align:center;
-          font-size:10px; color:#93a0a8; cursor:text; }
-  .agent { display:flex; flex-direction:column; min-height:540px; }
-  .msgs { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:9px; padding:2px; max-height:470px; }
+  .groupbody { min-height:172px; max-height:236px; overflow-y:auto; border:1px dashed #dfe4e9;
+               border-radius:6px; padding:6px; outline:none; }
+  .groupbody:focus { border-color:#9fbdd8; }
+  .groupbody:empty::before { content:"paste or add subjects"; font-size:10px; color:#b7c0c7; }
+  .drop-sm { min-height:26px; border:1px dashed #dfe4e9; border-radius:6px; padding:5px; outline:none; }
+  .drop-sm:focus { border-color:#9fbdd8; }
+  .agent { display:flex; flex-direction:column; min-height:560px; }
+  .msgs { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:9px; padding:2px; max-height:490px; }
   .msg { border-radius:9px; padding:10px 13px; font-size:13.5px; line-height:1.5; max-width:82%; white-space:pre-wrap; }
   .msg.user { background:#eef6fc; color:#12456e; align-self:flex-end; }
   .msg.bot { background:#f6f7f8; color:#2c3940; align-self:flex-start; }
@@ -893,9 +898,9 @@ def _research_style() -> str:
   .send { width:42px; height:42px; background:#1d6fa5; border:none; border-radius:9px; color:#fff;
           font-size:18px; cursor:pointer; }
   .send:disabled { opacity:.5; cursor:default; }
-  .issue { display:flex; gap:6px; align-items:center; margin-top:9px; flex-wrap:wrap; }
+  .issue { display:flex; flex-direction:column; gap:6px; }
   .issue input { border:0.5px solid #e2e6ea; border-radius:6px; padding:6px 8px; font-size:12px; }
-  .issue button { background:#1d6fa5;color:#fff;border:none;border-radius:6px;padding:6px 11px;font-size:12px;cursor:pointer; }
+  .issue button { background:#1d6fa5;color:#fff;border:none;border-radius:6px;padding:7px 11px;font-size:12px;cursor:pointer; }
   .hint { font-size:10px;color:#93a0a8;margin-top:6px;text-align:center; }
 </style>
 """
@@ -909,16 +914,21 @@ _RESEARCH_BODY = r"""
   <div id="banner"></div>
   <div class="grid">
 
-    <div class="card">
-      <div class="lbl">Subjects</div>
-      <div class="subjlist" id="subjlist"></div>
-      <form method="post" action="/portal/ui/issue" class="issue" id="issueForm">
-        <input type="hidden" name="provider_code" id="pcField">
-        <input type="hidden" name="key" id="keyField">
-        <input type="text" name="email" placeholder="new subject email" style="width:100%">
-        <input type="text" name="label" placeholder="label (optional)" style="width:100%">
-        <button type="submit">Issue code</button>
-      </form>
+    <div class="leftcol">
+      <div class="card">
+        <div class="lbl">Subjects</div>
+        <div class="subjlist" id="subjlist"></div>
+      </div>
+      <div class="card addbox">
+        <div class="lbl">Add subjects</div>
+        <form method="post" action="/portal/ui/issue" class="issue" id="issueForm">
+          <input type="hidden" name="provider_code" id="pcField">
+          <input type="hidden" name="key" id="keyField">
+          <input type="text" name="email" placeholder="new subject email" style="width:100%">
+          <input type="text" name="label" placeholder="label (optional)" style="width:100%">
+          <button type="submit">Generate &amp; email code</button>
+        </form>
+      </div>
     </div>
 
     <div>
@@ -927,21 +937,19 @@ _RESEARCH_BODY = r"""
           <span class="btns"><button class="minibtn" onclick="addSel('individual')">&rarr;</button>
           <button class="minibtn" onclick="clearBox('individual')">clear</button></span></div>
         <div id="individual"></div>
-        <div class="drop" data-box="individual">click a subject then &rarr;, or paste</div>
+        <div class="drop drop-sm" data-box="individual" tabindex="0"></div>
       </div>
       <div class="card box g1">
         <div class="hd"><span class="name" style="color:#185fa5">Group 1</span>
           <span class="btns"><button class="minibtn" onclick="addSel('group1')">&rarr;</button>
           <button class="minibtn" onclick="clearBox('group1')">clear</button></span></div>
-        <div id="group1"></div>
-        <div class="drop" data-box="group1">add or paste subjects</div>
+        <div class="groupbody" id="group1" data-box="group1" tabindex="0"></div>
       </div>
       <div class="card box g2">
         <div class="hd"><span class="name" style="color:#3b6d11">Group 2</span>
           <span class="btns"><button class="minibtn" onclick="addSel('group2')">&rarr;</button>
           <button class="minibtn" onclick="clearBox('group2')">clear</button></span></div>
-        <div id="group2"></div>
-        <div class="drop" data-box="group2">add or paste subjects</div>
+        <div class="groupbody" id="group2" data-box="group2" tabindex="0"></div>
       </div>
     </div>
 
@@ -1036,13 +1044,12 @@ function renderBox(box) {
 
 function renderAll() { renderList(); ['individual','group1','group2'].forEach(renderBox); }
 
-document.querySelectorAll('.drop').forEach(function(d) {
+document.querySelectorAll('[data-box]').forEach(function(d) {
   d.addEventListener('paste', function(e) {
     e.preventDefault();
     const box = d.getAttribute('data-box');
     const text = (e.clipboardData || window.clipboardData).getData('text');
-    let added = 0;
-    parsePaste(text).forEach(function(code){ if (addCode(box, code)) added++; });
+    parsePaste(text).forEach(function(code){ addCode(box, code); });
     renderAll();
   });
 });
