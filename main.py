@@ -1,37 +1,39 @@
 """
-Vagis backend — agent relay + metric ingestion + enrollment-code registry.
+Vagis backend — agent relay + two-system data pipeline (research + clinical).
 
-    Vagis app  ->  POST /chat    (holds the key)   ->  Anthropic API
-    Vagis app  ->  POST /ingest  (code, mode, CSV)  ->  Postgres
-    You        ->  POST /admin/researchers          ->  issues an RP code
-    Researcher ->  POST /portal/subjects            ->  issues an SE code
-    App        ->  POST /portal/validate            ->  checks an SE code is real
+Two parallel systems, one server, told apart by code prefix:
 
-Enrollment code scheme (no hyphens):
-    Researcher : RP + 3 digits                       e.g. RP014
-    Subject    : SE + rp(3) + user(4) + tail(3) = 12 e.g. SE0140001Q4J
-The embedded RP digits let a researcher's portal show only their own subjects.
-The random tail (unambiguous alphabet, no O/0/I/1/L) means a mistyped code fails
-cleanly instead of silently matching another real subject.
+                        RESEARCH                    CLINICAL (physician)
+  Provider code         RES001                      PHY001
+  Person code           SE0010001K3P (subject)      PT0010001K3P (patient)
+  Data retention        persistent (study data)     ephemeral (auto-purged 48h)
+  Stored in             research_uploads            clinical_holds
+  Governed by           study protocol + consent    individual review, no keep
 
-Endpoints:
-    GET  /health              -- server status
-    POST /chat                -- personal agent relay
-    POST /ingest              -- upload a cumulative CSV for one code + mode
-    GET  /ingest/list         -- list uploads (verification / portal read)
-    POST /admin/researchers   -- (admin) issue an RP code for a researcher
-    GET  /admin/researchers   -- (admin) list researchers
-    POST /portal/subjects     -- (researcher) issue the next SE code under their RP
-    GET  /portal/subjects     -- (researcher) list their own subjects
-    POST /portal/validate     -- (app) confirm an SE code exists, return its RP
+The person-code prefix routes the data: SE -> persistent research store;
+PT -> ephemeral clinical hold that self-deletes 48h after upload. The two live
+in separate tables so clinical data physically cannot land in the persistent
+store.
+
+Endpoints (foundation):
+  GET  /health                 -- status
+  POST /chat                   -- agent relay (unchanged)
+  POST /ingest                 -- app uploads a CSV; routed by code prefix
+  POST /portal/validate        -- app checks an SE or PT code is real
+  GET  /admin                  -- create providers (research or clinical)
+  GET  /portal                 -- provider login (RES -> research, PHY -> clinical)
 """
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import os
 import secrets
+import threading
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import anthropic
@@ -41,134 +43,167 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 # --------------------------------------------------------------------------
-# Configuration  (all via environment variables -- nothing secret in the code)
+# Configuration
 # --------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-
-# Shared secret the APP sends (Authorization: Bearer ...). Ships in the app, so
-# treat it as "keeps randoms out", not as a high-value secret.
 VAGIS_APP_TOKEN = os.environ.get("VAGIS_APP_TOKEN", "")
-
-# ADMIN secret only YOU know. Protects RP-code issuing. Never ships in the app.
-# Generate one with:  python -c "import secrets; print(secrets.token_urlsafe(32))"
 VAGIS_ADMIN_TOKEN = os.environ.get("VAGIS_ADMIN_TOKEN", "")
-
 MODEL = os.environ.get("VAGIS_MODEL", "claude-sonnet-4-6")
 MAX_TOKENS = int(os.environ.get("VAGIS_MAX_TOKENS", "1024"))
-
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
+# Clinical (PT) uploads self-delete this many hours after they arrive.
+CLINICAL_HOLD_HOURS = int(os.environ.get("VAGIS_CLINICAL_HOLD_HOURS", "48"))
+
 # Unambiguous alphabet for the random tail: no O, 0, I, 1, L.
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
+# Prefixes that define the two systems.
+PROVIDER_PREFIX = {"research": "RES", "clinical": "PHY"}   # 3 chars each
+PERSON_PREFIX   = {"research": "SE",  "clinical": "PT"}    # 2 chars each
+KIND_BY_PROVIDER_PREFIX = {v: k for k, v in PROVIDER_PREFIX.items()}
+KIND_BY_PERSON_PREFIX   = {v: k for k, v in PERSON_PREFIX.items()}
+
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-app = FastAPI(title="Vagis Agent Server")
+app = FastAPI(title="Vagis Server")
 
 
 # --------------------------------------------------------------------------
-# Enrollment code helpers  (pure functions -- unit tested)
+# Enrollment code scheme  (pure functions -- unit tested)
 # --------------------------------------------------------------------------
-def make_rp_code(seq: int) -> str:
+# Provider: <PREFIX 3> + <seq 3>              e.g. RES001 / PHY001
+# Person  : <PREFIX 2> + <provider 3> + <person 4> + <tail 3> = 12
+#           e.g. SE0010001K3P (research) / PT0010001K3P (clinical)
+def make_provider_code(kind: str, seq: int) -> str:
+    if kind not in PROVIDER_PREFIX:
+        raise ValueError(f"unknown kind {kind!r}")
     if not (1 <= seq <= 999):
-        raise ValueError("RP sequence out of range (1-999)")
-    return f"RP{seq:03d}"
+        raise ValueError("provider sequence out of range (1-999)")
+    return f"{PROVIDER_PREFIX[kind]}{seq:03d}"
 
 
-def make_se_code(rp_seq: int, user_seq: int) -> str:
-    if not (1 <= rp_seq <= 999):
-        raise ValueError("RP sequence out of range (1-999)")
-    if not (1 <= user_seq <= 9999):
-        raise ValueError("user sequence out of range (1-9999)")
+def make_person_code(kind: str, provider_seq: int, person_seq: int) -> str:
+    if kind not in PERSON_PREFIX:
+        raise ValueError(f"unknown kind {kind!r}")
+    if not (1 <= provider_seq <= 999):
+        raise ValueError("provider sequence out of range (1-999)")
+    if not (1 <= person_seq <= 9999):
+        raise ValueError("person sequence out of range (1-9999)")
     tail = "".join(secrets.choice(CODE_ALPHABET) for _ in range(3))
-    return f"SE{rp_seq:03d}{user_seq:04d}{tail}"
+    return f"{PERSON_PREFIX[kind]}{provider_seq:03d}{person_seq:04d}{tail}"
 
 
-def parse_rp_code(code: str) -> Optional[dict[str, Any]]:
+def parse_provider_code(code: str) -> Optional[dict[str, Any]]:
     code = (code or "").strip().upper()
-    if len(code) != 5 or not code.startswith("RP"):
+    if len(code) != 6:
         return None
-    digits = code[2:5]
-    if not digits.isdigit():
+    prefix, digits = code[:3], code[3:6]
+    if prefix not in KIND_BY_PROVIDER_PREFIX or not digits.isdigit():
         return None
-    return {"rp_code": code, "rp_seq": int(digits)}
+    return {"provider_code": code, "kind": KIND_BY_PROVIDER_PREFIX[prefix], "seq": int(digits)}
 
 
-def parse_se_code(code: str) -> Optional[dict[str, Any]]:
+def parse_person_code(code: str) -> Optional[dict[str, Any]]:
     code = (code or "").strip().upper()
-    if len(code) != 12 or not code.startswith("SE"):
+    if len(code) != 12:
         return None
-    rp_digits, user_digits, tail = code[2:5], code[5:9], code[9:12]
-    if not rp_digits.isdigit() or not user_digits.isdigit():
+    prefix = code[:2]
+    if prefix not in KIND_BY_PERSON_PREFIX:
+        return None
+    prov_digits, person_digits, tail = code[2:5], code[5:9], code[9:12]
+    if not prov_digits.isdigit() or not person_digits.isdigit():
         return None
     if any(c not in CODE_ALPHABET for c in tail):
         return None
+    kind = KIND_BY_PERSON_PREFIX[prefix]
     return {
-        "se_code": code,
-        "rp_code": f"RP{rp_digits}",
-        "rp_seq": int(rp_digits),
-        "user_seq": int(user_digits),
+        "person_code": code,
+        "kind": kind,
+        "provider_code": f"{PROVIDER_PREFIX[kind]}{prov_digits}",
+        "provider_seq": int(prov_digits),
+        "person_seq": int(person_digits),
         "tail": tail,
     }
 
 
 # --------------------------------------------------------------------------
-# Database
+# Data model
 # --------------------------------------------------------------------------
-CREATE_UPLOADS_SQL = """
-CREATE TABLE IF NOT EXISTS metric_uploads (
-    id              SERIAL PRIMARY KEY,
-    enrollment_code TEXT        NOT NULL,
-    mode            TEXT        NOT NULL,
-    filename        TEXT,
-    csv_text        TEXT        NOT NULL,
-    row_count       INTEGER,
-    uploaded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (enrollment_code, mode)
+# providers: both research (RES) and clinical (PHY), told apart by `kind`.
+CREATE_PROVIDERS_SQL = """
+CREATE TABLE IF NOT EXISTS providers (
+    provider_code TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL,
+    seq           INTEGER NOT NULL,
+    name          TEXT,
+    email         TEXT,
+    secret        TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (kind, seq)
 );
 """
 
-CREATE_RESEARCHERS_SQL = """
-CREATE TABLE IF NOT EXISTS researchers (
-    rp_code    TEXT PRIMARY KEY,
-    rp_seq     INTEGER NOT NULL UNIQUE,
-    name       TEXT,
-    email      TEXT,
-    secret     TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+# persons: subjects (SE, research) and patients (PT, clinical).
+CREATE_PERSONS_SQL = """
+CREATE TABLE IF NOT EXISTS persons (
+    person_code   TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL,
+    provider_code TEXT NOT NULL REFERENCES providers(provider_code),
+    person_seq    INTEGER NOT NULL,
+    label         TEXT,
+    email         TEXT,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (provider_code, person_seq)
 );
 """
 
-CREATE_SUBJECTS_SQL = """
-CREATE TABLE IF NOT EXISTS subjects (
-    se_code    TEXT PRIMARY KEY,
-    rp_code    TEXT NOT NULL REFERENCES researchers(rp_code),
-    user_seq   INTEGER NOT NULL,
-    label      TEXT,
-    email      TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (rp_code, user_seq)
+# research_uploads: PERSISTENT. One row per (subject, mode); re-upload replaces.
+CREATE_RESEARCH_UPLOADS_SQL = """
+CREATE TABLE IF NOT EXISTS research_uploads (
+    id           SERIAL PRIMARY KEY,
+    person_code  TEXT NOT NULL,
+    mode         TEXT NOT NULL,
+    filename     TEXT,
+    csv_text     TEXT NOT NULL,
+    row_count    INTEGER,
+    uploaded_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (person_code, mode)
 );
 """
 
-UPSERT_UPLOAD_SQL = """
-INSERT INTO metric_uploads (enrollment_code, mode, filename, csv_text, row_count, uploaded_at)
+# clinical_holds: EPHEMERAL. Same shape plus expires_at; purged after it passes.
+CREATE_CLINICAL_HOLDS_SQL = """
+CREATE TABLE IF NOT EXISTS clinical_holds (
+    id           SERIAL PRIMARY KEY,
+    person_code  TEXT NOT NULL,
+    mode         TEXT NOT NULL,
+    filename     TEXT,
+    csv_text     TEXT NOT NULL,
+    row_count    INTEGER,
+    uploaded_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at   TIMESTAMPTZ NOT NULL,
+    UNIQUE (person_code, mode)
+);
+"""
+
+UPSERT_RESEARCH_SQL = """
+INSERT INTO research_uploads (person_code, mode, filename, csv_text, row_count, uploaded_at)
 VALUES (%s, %s, %s, %s, %s, now())
-ON CONFLICT (enrollment_code, mode)
-DO UPDATE SET filename    = EXCLUDED.filename,
-              csv_text    = EXCLUDED.csv_text,
-              row_count   = EXCLUDED.row_count,
-              uploaded_at = now()
+ON CONFLICT (person_code, mode)
+DO UPDATE SET filename=EXCLUDED.filename, csv_text=EXCLUDED.csv_text,
+              row_count=EXCLUDED.row_count, uploaded_at=now()
 RETURNING uploaded_at;
 """
 
-LIST_UPLOADS_SQL = """
-SELECT enrollment_code, mode, filename, row_count, uploaded_at
-FROM metric_uploads
-{where}
-ORDER BY enrollment_code, mode;
+UPSERT_CLINICAL_SQL = """
+INSERT INTO clinical_holds (person_code, mode, filename, csv_text, row_count, uploaded_at, expires_at)
+VALUES (%s, %s, %s, %s, %s, now(), %s)
+ON CONFLICT (person_code, mode)
+DO UPDATE SET filename=EXCLUDED.filename, csv_text=EXCLUDED.csv_text,
+              row_count=EXCLUDED.row_count, uploaded_at=now(), expires_at=EXCLUDED.expires_at
+RETURNING uploaded_at, expires_at;
 """
 
 
@@ -182,11 +217,16 @@ def db_connect():
 
 
 def ensure_tables(cur) -> None:
-    cur.execute(CREATE_RESEARCHERS_SQL)  # referenced by subjects, create first
-    cur.execute(CREATE_SUBJECTS_SQL)
-    cur.execute(CREATE_UPLOADS_SQL)
-    # Migration for tables created before the email column existed.
-    cur.execute("ALTER TABLE subjects ADD COLUMN IF NOT EXISTS email TEXT;")
+    cur.execute(CREATE_PROVIDERS_SQL)   # referenced by persons, first
+    cur.execute(CREATE_PERSONS_SQL)
+    cur.execute(CREATE_RESEARCH_UPLOADS_SQL)
+    cur.execute(CREATE_CLINICAL_HOLDS_SQL)
+
+
+def purge_expired(cur) -> int:
+    """Delete clinical holds whose window has passed. Returns rows removed."""
+    cur.execute("DELETE FROM clinical_holds WHERE expires_at < now();")
+    return cur.rowcount
 
 
 @app.on_event("startup")
@@ -197,16 +237,39 @@ def init_db() -> None:
         conn = psycopg2.connect(DATABASE_URL)
         with conn, conn.cursor() as cur:
             ensure_tables(cur)
+            purge_expired(cur)
         conn.close()
     except Exception as e:
-        print(f"[startup] could not initialise database: {type(e).__name__}: {e}")
+        print(f"[startup] db init failed: {type(e).__name__}: {e}")
+
+
+# Background sweeper: purge expired clinical holds even with no traffic.
+def _purge_loop() -> None:
+    while True:
+        time.sleep(900)  # every 15 minutes
+        if not DATABASE_URL:
+            continue
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            with conn, conn.cursor() as cur:
+                n = purge_expired(cur)
+            conn.close()
+            if n:
+                print(f"[purge] removed {n} expired clinical hold(s)")
+        except Exception as e:
+            print(f"[purge] sweep failed: {type(e).__name__}: {e}")
+
+
+@app.on_event("startup")
+def start_purge_thread() -> None:
+    if DATABASE_URL:
+        threading.Thread(target=_purge_loop, daemon=True).start()
 
 
 # --------------------------------------------------------------------------
 # Auth
 # --------------------------------------------------------------------------
 def check_app_auth(authorization: str | None) -> None:
-    """App-level shared token (Authorization: Bearer <VAGIS_APP_TOKEN>)."""
     if not VAGIS_APP_TOKEN:
         raise HTTPException(status_code=500, detail="Server token not configured.")
     if authorization != f"Bearer {VAGIS_APP_TOKEN}":
@@ -214,28 +277,28 @@ def check_app_auth(authorization: str | None) -> None:
 
 
 def check_admin_auth(authorization: str | None) -> None:
-    """Admin token, only you (Authorization: Bearer <VAGIS_ADMIN_TOKEN>)."""
     if not VAGIS_ADMIN_TOKEN:
         raise HTTPException(status_code=500, detail="Admin token not configured.")
     if authorization != f"Bearer {VAGIS_ADMIN_TOKEN}":
         raise HTTPException(status_code=401, detail="Admin unauthorized.")
 
 
-def authenticate_researcher(cur, rp_code: str, secret: str) -> dict[str, Any]:
-    """Confirm rp_code + secret match a real researcher; return their row."""
-    parsed = parse_rp_code(rp_code)
+def authenticate_provider(cur, provider_code: str, secret: str) -> Optional[dict[str, Any]]:
+    """Return provider dict if code+secret match, else None."""
+    parsed = parse_provider_code(provider_code)
     if not parsed:
-        raise HTTPException(status_code=400, detail="Malformed RP code.")
-    cur.execute(
-        "SELECT rp_code, rp_seq, secret FROM researchers WHERE rp_code = %s",
-        (parsed["rp_code"],),
-    )
+        return None
+    cur.execute("SELECT provider_code, kind, seq, name, secret FROM providers WHERE provider_code = %s;",
+                (parsed["provider_code"],))
     row = cur.fetchone()
-    if not row or not secret or not secrets.compare_digest(row[2], secret):
-        raise HTTPException(status_code=401, detail="Invalid researcher credentials.")
-    return {"rp_code": row[0], "rp_seq": row[1]}
+    if not row or not secret or not secrets.compare_digest(row[4], secret):
+        return None
+    return {"provider_code": row[0], "kind": row[1], "seq": row[2], "name": row[3]}
 
 
+# --------------------------------------------------------------------------
+# Chat models + system prompt  (unchanged from prior version)
+# --------------------------------------------------------------------------
 # --------------------------------------------------------------------------
 # Request / response shapes
 # --------------------------------------------------------------------------
@@ -355,8 +418,10 @@ Date: {req.date or "(not specified)"}
 """
 
 
+
+
 # --------------------------------------------------------------------------
-# Endpoints: health + chat
+# Health + chat
 # --------------------------------------------------------------------------
 @app.get("/health")
 def health() -> dict[str, Any]:
@@ -367,6 +432,7 @@ def health() -> dict[str, Any]:
         "app_token_set": bool(VAGIS_APP_TOKEN),
         "admin_token_set": bool(VAGIS_ADMIN_TOKEN),
         "database_url_set": bool(DATABASE_URL),
+        "clinical_hold_hours": CLINICAL_HOLD_HOURS,
     }
 
 
@@ -402,8 +468,10 @@ def chat(req: ChatRequest, authorization: str | None = Header(default=None)) -> 
     return ChatResponse(reply=reply)
 
 
+
+
 # --------------------------------------------------------------------------
-# Endpoints: ingestion
+# Ingestion  (routed by person-code prefix: SE -> persistent, PT -> ephemeral)
 # --------------------------------------------------------------------------
 def count_csv_rows(text: str) -> int:
     reader = csv.reader(io.StringIO(text))
@@ -411,8 +479,8 @@ def count_csv_rows(text: str) -> int:
     return max(0, n - 1)
 
 
-def subject_exists(cur, se_code: str) -> bool:
-    cur.execute("SELECT 1 FROM subjects WHERE se_code = %s", (se_code,))
+def person_exists(cur, person_code: str, kind: str) -> bool:
+    cur.execute("SELECT 1 FROM persons WHERE person_code = %s AND kind = %s;", (person_code, kind))
     return cur.fetchone() is not None
 
 
@@ -423,16 +491,16 @@ async def ingest(
     file: UploadFile = File(...),
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    """Store one cumulative CSV for a subject + mode. Re-upload replaces prior."""
+    """Store one cumulative CSV. The code prefix routes it:
+    SE -> research_uploads (persistent). PT -> clinical_holds (ephemeral, 48h)."""
     check_app_auth(authorization)
 
-    parsed = parse_se_code(enrollment_code)
+    parsed = parse_person_code(enrollment_code)
     if not parsed:
-        raise HTTPException(
-            status_code=400,
-            detail="enrollment_code must be a valid SE code (e.g. SE0140001Q4J).",
-        )
-    code = parsed["se_code"]
+        raise HTTPException(status_code=400,
+            detail="enrollment_code must be a valid SE or PT code.")
+    code = parsed["person_code"]
+    kind = parsed["kind"]
 
     mode_clean = (mode or "").strip().lower()
     if not mode_clean:
@@ -454,200 +522,45 @@ async def ingest(
     try:
         with conn, conn.cursor() as cur:
             ensure_tables(cur)
-            # The code must have been issued through the registry first.
-            if not subject_exists(cur, code):
-                raise HTTPException(
-                    status_code=404,
-                    detail="Unknown enrollment code. It must be issued before uploading.",
-                )
-            cur.execute(
-                UPSERT_UPLOAD_SQL,
-                (code, mode_clean, file.filename, csv_text, row_count),
-            )
-            uploaded_at = cur.fetchone()[0]
+            purge_expired(cur)
+            if not person_exists(cur, code, kind):
+                raise HTTPException(status_code=404,
+                    detail="Unknown enrollment code. It must be issued before uploading.")
+            if kind == "research":
+                cur.execute(UPSERT_RESEARCH_SQL,
+                            (code, mode_clean, file.filename, csv_text, row_count))
+                uploaded_at = cur.fetchone()[0]
+                return {
+                    "status": "ok", "system": "research", "enrollment_code": code,
+                    "mode": mode_clean, "row_count": row_count,
+                    "uploaded_at": uploaded_at.isoformat(), "retention": "persistent",
+                }
+            else:  # clinical -> ephemeral hold
+                expires = datetime.now(timezone.utc) + timedelta(hours=CLINICAL_HOLD_HOURS)
+                cur.execute(UPSERT_CLINICAL_SQL,
+                            (code, mode_clean, file.filename, csv_text, row_count, expires))
+                uploaded_at, expires_at = cur.fetchone()
+                return {
+                    "status": "ok", "system": "clinical", "enrollment_code": code,
+                    "mode": mode_clean, "row_count": row_count,
+                    "uploaded_at": uploaded_at.isoformat(),
+                    "expires_at": expires_at.isoformat(),
+                    "retention": f"ephemeral ({CLINICAL_HOLD_HOURS}h)",
+                }
     finally:
         conn.close()
 
-    return {
-        "status": "ok",
-        "enrollment_code": code,
-        "mode": mode_clean,
-        "filename": file.filename,
-        "row_count": row_count,
-        "uploaded_at": uploaded_at.isoformat(),
-    }
 
-
-@app.get("/ingest/list")
-def ingest_list(
-    enrollment_code: str | None = None,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    check_app_auth(authorization)
-    params: tuple[Any, ...] = ()
-    where = ""
-    if enrollment_code:
-        where = "WHERE enrollment_code = %s"
-        params = (enrollment_code.strip().upper(),)
-
-    conn = db_connect()
-    try:
-        with conn, conn.cursor() as cur:
-            ensure_tables(cur)
-            cur.execute(LIST_UPLOADS_SQL.format(where=where), params)
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    items = [
-        {
-            "enrollment_code": r[0],
-            "mode": r[1],
-            "filename": r[2],
-            "row_count": r[3],
-            "uploaded_at": r[4].isoformat() if r[4] else None,
-        }
-        for r in rows
-    ]
-    return {"count": len(items), "items": items}
-
-
-# --------------------------------------------------------------------------
-# Endpoints: registry (admin issues RP, researcher issues SE, app validates SE)
-# --------------------------------------------------------------------------
-@app.post("/admin/researchers")
-def issue_researcher(
-    req: IssueResearcherRequest,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    """ADMIN: create the next researcher. Returns their RP code and secret.
-    Give the researcher BOTH -- the secret is how they issue subjects and, later,
-    log into their portal. Store it safely; it is shown once here."""
-    check_admin_auth(authorization)
-    secret = secrets.token_urlsafe(24)
-
-    conn = db_connect()
-    try:
-        with conn, conn.cursor() as cur:
-            ensure_tables(cur)
-            cur.execute("SELECT COALESCE(MAX(rp_seq), 0) FROM researchers;")
-            next_seq = cur.fetchone()[0] + 1
-            if next_seq > 999:
-                raise HTTPException(status_code=409, detail="RP capacity reached (999).")
-            rp_code = make_rp_code(next_seq)
-            cur.execute(
-                "INSERT INTO researchers (rp_code, rp_seq, name, email, secret) "
-                "VALUES (%s, %s, %s, %s, %s);",
-                (rp_code, next_seq, req.name or None, req.email or None, secret),
-            )
-    finally:
-        conn.close()
-
-    return {"status": "ok", "rp_code": rp_code, "secret": secret,
-            "name": req.name, "email": req.email}
-
-
-@app.get("/admin/researchers")
-def list_researchers(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    """ADMIN: list researchers (no secrets returned)."""
-    check_admin_auth(authorization)
-    conn = db_connect()
-    try:
-        with conn, conn.cursor() as cur:
-            ensure_tables(cur)
-            cur.execute(
-                "SELECT r.rp_code, r.name, r.email, r.created_at, "
-                "(SELECT COUNT(*) FROM subjects s WHERE s.rp_code = r.rp_code) "
-                "FROM researchers r ORDER BY r.rp_seq;"
-            )
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-    return {
-        "count": len(rows),
-        "items": [
-            {"rp_code": r[0], "name": r[1], "email": r[2],
-             "created_at": r[3].isoformat() if r[3] else None, "subjects": r[4]}
-            for r in rows
-        ],
-    }
-
-
-@app.post("/portal/subjects")
-def issue_subject(
-    req: IssueSubjectRequest,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    """RESEARCHER: issue the next SE code under their own RP. Auth = rp_code + secret.
-    (The Authorization header still carries the app token, so the endpoint isn't open.)"""
-    check_app_auth(authorization)
-
-    conn = db_connect()
-    try:
-        with conn, conn.cursor() as cur:
-            ensure_tables(cur)
-            researcher = authenticate_researcher(cur, req.rp_code, req.secret)
-            cur.execute(
-                "SELECT COALESCE(MAX(user_seq), 0) FROM subjects WHERE rp_code = %s;",
-                (researcher["rp_code"],),
-            )
-            next_user = cur.fetchone()[0] + 1
-            if next_user > 9999:
-                raise HTTPException(status_code=409, detail="Subject capacity reached (9999).")
-            se_code = make_se_code(researcher["rp_seq"], next_user)
-            cur.execute(
-                "INSERT INTO subjects (se_code, rp_code, user_seq, label) "
-                "VALUES (%s, %s, %s, %s);",
-                (se_code, researcher["rp_code"], next_user, req.label or None),
-            )
-    finally:
-        conn.close()
-
-    return {"status": "ok", "se_code": se_code, "rp_code": researcher["rp_code"],
-            "user_seq": next_user}
-
-
-@app.get("/portal/subjects")
-def list_subjects(
-    rp_code: str,
-    secret: str,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    """RESEARCHER: list their own subjects (auth = rp_code + secret as query params)."""
-    check_app_auth(authorization)
-    conn = db_connect()
-    try:
-        with conn, conn.cursor() as cur:
-            ensure_tables(cur)
-            researcher = authenticate_researcher(cur, rp_code, secret)
-            cur.execute(
-                "SELECT se_code, user_seq, label, created_at FROM subjects "
-                "WHERE rp_code = %s ORDER BY user_seq;",
-                (researcher["rp_code"],),
-            )
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-    return {
-        "rp_code": researcher["rp_code"],
-        "count": len(rows),
-        "items": [
-            {"se_code": r[0], "user_seq": r[1], "label": r[2],
-             "created_at": r[3].isoformat() if r[3] else None}
-            for r in rows
-        ],
-    }
+class ValidateRequest(BaseModel):
+    enrollment_code: str
 
 
 @app.post("/portal/validate")
-def validate_subject(
-    req: ValidateRequest,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    """APP: confirm an SE code is well-formed AND issued. Returns its RP if valid.
-    The app calls this when a user enters their code, before storing it."""
+def validate_person(req: ValidateRequest,
+                    authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """App checks an SE or PT code is well-formed AND issued. Returns its provider."""
     check_app_auth(authorization)
-    parsed = parse_se_code(req.se_code)
+    parsed = parse_person_code(req.enrollment_code)
     if not parsed:
         return {"valid": False, "reason": "malformed"}
 
@@ -655,213 +568,78 @@ def validate_subject(
     try:
         with conn, conn.cursor() as cur:
             ensure_tables(cur)
-            cur.execute(
-                "SELECT rp_code FROM subjects WHERE se_code = %s;",
-                (parsed["se_code"],),
-            )
+            cur.execute("SELECT provider_code, kind FROM persons WHERE person_code = %s;",
+                        (parsed["person_code"],))
             row = cur.fetchone()
     finally:
         conn.close()
 
     if not row:
         return {"valid": False, "reason": "not_issued"}
-    return {"valid": True, "se_code": parsed["se_code"], "rp_code": row[0]}
+    return {"valid": True, "enrollment_code": parsed["person_code"],
+            "provider_code": row[0], "system": row[1]}
 
 
 # --------------------------------------------------------------------------
-# Admin page  (private tool, NO JavaScript -- plain HTML forms that POST)
+# Admin JSON endpoints (create/list providers of either kind)
 # --------------------------------------------------------------------------
-# GET  /admin              -> the page (token + create form + list form)
-# POST /admin/ui/create    -> creates a researcher, shows the result page
-# POST /admin/ui/list      -> shows the researcher list page
-# The admin token is a normal form field; the server checks it. Because these are
-# real <form> submits, they work even if the browser blocks scripts.
-def _admin_style() -> str:
-    return """
-<style>
-  * { box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-         max-width: 760px; margin: 0 auto; padding: 24px; color: #1a1a1a; background: #fafafa; }
-  h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
-  .sub { color: #666; font-size: 14px; margin: 0 0 24px; }
-  .card { background: #fff; border: 1px solid #e4e4e4; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
-  .card h2 { font-size: 16px; font-weight: 600; margin: 0 0 14px; }
-  label { display: block; font-size: 13px; color: #444; margin: 12px 0 4px; }
-  input { width: 100%; padding: 10px 12px; font-size: 15px; border: 1px solid #d0d0d0;
-          border-radius: 8px; background: #fff; }
-  button { margin-top: 16px; padding: 10px 18px; font-size: 15px; font-weight: 500; color: #fff;
-           background: #0f6e56; border: none; border-radius: 8px; cursor: pointer; }
-  button.secondary { background: #444; }
-  .result { margin: 0 0 20px; padding: 16px; border-radius: 8px; background: #e1f5ee; border: 1px solid #9fe1cb; }
-  .result .row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 15px; }
-  .result .k { color: #085041; font-weight: 500; }
-  .result .v { font-family: ui-monospace, Menlo, monospace; font-size: 16px; }
-  .warn { color: #854f0b; font-size: 13px; margin-top: 10px; }
-  .err { margin: 0 0 20px; padding: 16px; border-radius: 8px; background: #fcebeb; border: 1px solid #f7c1c1; color: #a32d2d; }
-  table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 14px; }
-  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #eee; }
-  th { color: #666; font-weight: 500; font-size: 12px; text-transform: uppercase; }
-  td.mono { font-family: ui-monospace, Menlo, monospace; }
-  .muted { color: #999; font-size: 13px; }
-  a.back { display: inline-block; margin-top: 8px; color: #0f6e56; font-size: 14px; }
-</style>
-"""
+class IssueProviderRequest(BaseModel):
+    kind: str            # "research" or "clinical"
+    name: str = ""
+    email: str = ""
 
 
-def _admin_page(token: str = "", banner: str = "") -> str:
-    tok_val = (token or "").replace('"', "&quot;")
-    return f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Vagis Admin</title>{_admin_style()}</head>
-<body>
-  <h1>Vagis Admin</h1>
-  <p class="sub">Create researcher accounts and view the list. Private tool.</p>
-  {banner}
-  <div class="card">
-    <h2>Create a researcher</h2>
-    <form method="post" action="/admin/ui/create">
-      <label>Admin token</label>
-      <input name="token" type="password" placeholder="Paste your VAGIS_ADMIN_TOKEN" value="{tok_val}" autocomplete="off">
-      <label>Name (optional)</label>
-      <input name="name" type="text" placeholder="Dr. Jane Smith">
-      <label>Researcher email (required)</label>
-      <input name="email" type="text" placeholder="jane@example.com">
-      <button type="submit">Create researcher</button>
-    </form>
-  </div>
-  <div class="card">
-    <h2>Researchers</h2>
-    <form method="post" action="/admin/ui/list">
-      <label>Admin token</label>
-      <input name="token" type="password" placeholder="Paste your VAGIS_ADMIN_TOKEN" value="{tok_val}" autocomplete="off">
-      <button type="submit" class="secondary">Show list</button>
-    </form>
-  </div>
-</body></html>"""
-
-
-@app.get("/admin", response_class=HTMLResponse)
-def admin_page() -> HTMLResponse:
-    return HTMLResponse(_admin_page())
-
-
-@app.post("/admin/ui/create", response_class=HTMLResponse)
-def admin_ui_create(
-    token: str = Form(""),
-    name: str = Form(""),
-    email: str = Form(""),
-) -> HTMLResponse:
-    # Trim whitespace so a stray space in the token never blocks you.
-    if token.strip() != (VAGIS_ADMIN_TOKEN or "").strip() or not VAGIS_ADMIN_TOKEN:
-        banner = '<div class="err">Admin token did not match. Check it and try again.</div>'
-        return HTMLResponse(_admin_page(token, banner))
-
-    if not email.strip():
-        return HTMLResponse(_admin_page(token,
-            '<div class="err">A researcher email is required.</div>'))
-
+def _issue_provider(cur, kind: str, name: str, email: str) -> dict[str, Any]:
+    if kind not in PROVIDER_PREFIX:
+        raise HTTPException(status_code=400, detail="kind must be 'research' or 'clinical'.")
     secret = secrets.token_urlsafe(24)
+    cur.execute("SELECT COALESCE(MAX(seq), 0) FROM providers WHERE kind = %s;", (kind,))
+    next_seq = cur.fetchone()[0] + 1
+    if next_seq > 999:
+        raise HTTPException(status_code=409, detail="Provider capacity reached (999).")
+    code = make_provider_code(kind, next_seq)
+    cur.execute(
+        "INSERT INTO providers (provider_code, kind, seq, name, email, secret) "
+        "VALUES (%s,%s,%s,%s,%s,%s);",
+        (code, kind, next_seq, name or None, email or None, secret))
+    return {"provider_code": code, "kind": kind, "secret": secret}
+
+
+@app.post("/admin/providers")
+def issue_provider(req: IssueProviderRequest,
+                   authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    check_admin_auth(authorization)
     conn = db_connect()
     try:
         with conn, conn.cursor() as cur:
             ensure_tables(cur)
-            cur.execute("SELECT COALESCE(MAX(rp_seq), 0) FROM researchers;")
-            next_seq = cur.fetchone()[0] + 1
-            if next_seq > 999:
-                return HTMLResponse(_admin_page(token, '<div class="err">RP capacity reached (999).</div>'))
-            rp_code = make_rp_code(next_seq)
-            cur.execute(
-                "INSERT INTO researchers (rp_code, rp_seq, name, email, secret) VALUES (%s,%s,%s,%s,%s);",
-                (rp_code, next_seq, name or None, email.strip(), secret),
-            )
+            out = _issue_provider(cur, req.kind, req.name, req.email)
     finally:
         conn.close()
-
-    mail_body = (
-        f"Hello,\n\nYou have been set up as a researcher on Vagis. Your access details:\n\n"
-        f"Researcher ID: {rp_code}\nKey: {secret}\n\n"
-        f"Sign in at the researcher portal with these to view your subjects' shared data. "
-        f"Keep the Key private.\n\nThanks."
-    )
-    banner = (
-        '<div class="result">'
-        f'<div class="row"><span class="k">Researcher ID</span><span class="v">{rp_code}</span></div>'
-        f'<div class="row"><span class="k">Key</span><span class="v">{secret}</span></div>'
-        f'<div class="row"><span class="k">Email</span><span class="v">{_esc(email.strip())}</span></div>'
-        '<div class="warn">The key is never shown again after you leave this page.</div>'
-        + _mailto_button(email.strip(), "Your Vagis researcher access", mail_body,
-                         "Email this researcher")
-        + '</div>'
-    )
-    return HTMLResponse(_admin_page(token, banner))
+    return {"status": "ok", **out}
 
 
-@app.post("/admin/ui/list", response_class=HTMLResponse)
-def admin_ui_list(token: str = Form("")) -> HTMLResponse:
-    if token.strip() != (VAGIS_ADMIN_TOKEN or "").strip() or not VAGIS_ADMIN_TOKEN:
-        return HTMLResponse(_admin_page(token, '<div class="err">Admin token did not match.</div>'))
-
-    conn = db_connect()
-    try:
-        with conn, conn.cursor() as cur:
-            ensure_tables(cur)
-            cur.execute(
-                "SELECT r.rp_code, r.name, r.email, r.created_at, "
-                "(SELECT COUNT(*) FROM subjects s WHERE s.rp_code = r.rp_code) "
-                "FROM researchers r ORDER BY r.rp_seq;"
-            )
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    if not rows:
-        table = '<p class="muted">No researchers yet.</p>'
-    else:
-        body = "".join(
-            f'<tr><td class="mono">{r[0]}</td><td>{r[1] or ""}</td><td>{r[2] or ""}</td>'
-            f'<td>{r[4]}</td><td>{r[3].isoformat()[:10] if r[3] else ""}</td></tr>'
-            for r in rows
-        )
-        table = (
-            '<table><thead><tr><th>RP code</th><th>Name</th><th>Email</th>'
-            '<th>Subjects</th><th>Created</th></tr></thead><tbody>' + body + '</tbody></table>'
-        )
-    banner = f'<div class="card"><h2>Researchers ({len(rows)})</h2>{table}' \
-             f'<a class="back" href="/admin">&larr; Back</a></div>'
-    return HTMLResponse(_admin_page(token, banner))
-
+def _issue_person(cur, provider: dict[str, Any], label: str, email: str) -> dict[str, Any]:
+    kind = provider["kind"]
+    cur.execute("SELECT COALESCE(MAX(person_seq), 0) FROM persons WHERE provider_code = %s;",
+                (provider["provider_code"],))
+    next_person = cur.fetchone()[0] + 1
+    if next_person > 9999:
+        raise HTTPException(status_code=409, detail="Person capacity reached (9999).")
+    code = make_person_code(kind, provider["seq"], next_person)
+    cur.execute("INSERT INTO persons (person_code, kind, provider_code, person_seq, label, email) "
+                "VALUES (%s,%s,%s,%s,%s,%s);",
+                (code, kind, provider["provider_code"], next_person, label or None, email or None))
+    return {"person_code": code, "person_seq": next_person}
 
 # --------------------------------------------------------------------------
-# Researcher portal  (NO JavaScript -- plain HTML forms, like the admin page)
+# Web pages  (NO JavaScript -- plain HTML forms)
 # --------------------------------------------------------------------------
-# GET  /portal              -> login page (Researcher ID + Key)
-# POST /portal/ui/dashboard -> authenticate, show subjects + issue button
-# POST /portal/ui/issue     -> issue the next SE code, back to dashboard
-# POST /portal/ui/subject   -> show one subject's modes
-# POST /portal/ui/view      -> show one mode's CSV as a read-only table
-#
-# Credentials (rp_code + key) travel in hidden form fields on every page, so no
-# cookies/sessions are needed and the key never lands in a URL. VIEW-ONLY:
-# there is no CSV download anywhere in this portal, by design.
-import csv as _csv
-import io as _io
 from html import escape as _esc
 from urllib.parse import quote as _q
 
 
-def _mailto_button(email: str, subject: str, body: str, text: str = "Email this person") -> str:
-    """A button that opens the device's default mail app, pre-filled. No service
-    needed. Returns empty string if there's no address."""
-    if not email:
-        return ""
-    href = f"mailto:{_q(email)}?subject={_q(subject)}&body={_q(body)}"
-    return (f'<a href="{href}" style="display:inline-block;margin-top:10px;padding:9px 16px;'
-            f'background:#0f6e56;color:#fff;border-radius:8px;font-size:14px;'
-            f'font-weight:500;text-decoration:none;">{_esc(text)}</a>')
-
-
-def _portal_style() -> str:
+def _style() -> str:
     return """
 <style>
   * { box-sizing: border-box; }
@@ -869,11 +647,11 @@ def _portal_style() -> str:
          max-width: 980px; margin: 0 auto; padding: 24px; color: #1a1a1a; background: #fafafa; }
   h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
   h2 { font-size: 16px; font-weight: 600; margin: 0 0 14px; }
-  .sub { color: #666; font-size: 14px; margin: 0 0 24px; }
+  .sub { color: #666; font-size: 14px; margin: 0 0 22px; }
   .card { background: #fff; border: 1px solid #e4e4e4; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
   label { display: block; font-size: 13px; color: #444; margin: 12px 0 4px; }
-  input { width: 100%; padding: 10px 12px; font-size: 15px; border: 1px solid #d0d0d0; border-radius: 8px; background: #fff; }
-  button { margin-top: 8px; padding: 9px 16px; font-size: 14px; font-weight: 500; color: #fff;
+  input, select { width: 100%; padding: 10px 12px; font-size: 15px; border: 1px solid #d0d0d0; border-radius: 8px; background: #fff; }
+  button { margin-top: 10px; padding: 9px 16px; font-size: 14px; font-weight: 500; color: #fff;
            background: #0f6e56; border: none; border-radius: 8px; cursor: pointer; }
   button.secondary { background: #444; }
   button.small { padding: 6px 12px; font-size: 13px; margin: 0; }
@@ -890,100 +668,167 @@ def _portal_style() -> str:
   td.mono, .mono { font-family: ui-monospace, Menlo, monospace; }
   .muted { color: #999; font-size: 13px; }
   .tablewrap { overflow-x: auto; border: 1px solid #eee; border-radius: 8px; }
-  a.back, .backbtn { display: inline-block; margin-top: 8px; color: #0f6e56; font-size: 14px; background: none; padding: 0; }
+  .backbtn { display: inline-block; margin-top: 8px; color: #0f6e56; font-size: 14px; background: none; padding: 0; border: none; cursor: pointer; }
   .pill { display: inline-block; font-size: 11px; color: #0f6e56; background: #e1f5ee; border-radius: 5px; padding: 2px 8px; margin-left: 6px; }
+  .flag { display: inline-block; font-size: 11px; color: #7a3b00; background: #ffe6c7; border-radius: 5px; padding: 2px 8px; margin-left: 6px; font-weight: 600; }
   .subrow { display: flex; align-items: center; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid #f0f0f0; }
   .subrow:last-child { border-bottom: none; }
+  .badge { display:inline-block; font-size:11px; font-weight:600; padding:2px 9px; border-radius:6px; }
+  .badge.res { background:#e1f5ee; color:#085041; }
+  .badge.phy { background:#e6eefc; color:#1c458f; }
 </style>
 """
 
 
-def _hidden_creds(rp_code: str, key: str) -> str:
-    return (f'<input type="hidden" name="rp_code" value="{_esc(rp_code)}">'
+def _hidden(provider_code: str, key: str) -> str:
+    return (f'<input type="hidden" name="provider_code" value="{_esc(provider_code)}">'
             f'<input type="hidden" name="key" value="{_esc(key)}">')
 
 
-def _portal_login(banner: str = "") -> str:
+def _mailto(email: str, subject: str, body: str, text: str) -> str:
+    if not email:
+        return ""
+    href = f"mailto:{_q(email)}?subject={_q(subject)}&body={_q(body)}"
+    return (f'<a href="{href}" style="display:inline-block;margin-top:10px;padding:9px 16px;'
+            f'background:#0f6e56;color:#fff;border-radius:8px;font-size:14px;font-weight:500;'
+            f'text-decoration:none;">{_esc(text)}</a>')
+
+
+def _mode_label(m: str) -> str:
+    return {"sleep": "Sleep", "rest": "Rest", "stand": "Stand", "breathwork": "Breathwork"}.get(m, m.capitalize())
+
+
+# ---- Admin page ----------------------------------------------------------
+def _admin_page(token: str = "", banner: str = "") -> str:
+    tok = _esc(token)
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Vagis Researcher Portal</title>{_portal_style()}</head><body>
-  <h1>Vagis Researcher Portal</h1>
-  <p class="sub">Sign in to view your subjects' shared data.</p>
+<title>Vagis Admin</title>{_style()}</head><body>
+  <h1>Vagis Admin</h1>
+  <p class="sub">Create provider accounts for the research and clinical systems.</p>
   {banner}
   <div class="card">
-    <h2>Sign in</h2>
-    <form method="post" action="/portal/ui/dashboard">
-      <label>Researcher ID</label>
-      <input name="rp_code" type="text" placeholder="e.g. RP001" autocomplete="off">
-      <label>Key</label>
-      <input name="key" type="password" placeholder="Your key" autocomplete="off">
-      <div><button type="submit">Sign in</button></div>
+    <h2>Create a provider</h2>
+    <form method="post" action="/admin/ui/create">
+      <label>Admin token</label>
+      <input name="token" type="password" placeholder="Your VAGIS_ADMIN_TOKEN" value="{tok}" autocomplete="off">
+      <label>System</label>
+      <select name="kind">
+        <option value="research">Research  (RES &mdash; persistent study data)</option>
+        <option value="clinical">Clinical  (PHY &mdash; ephemeral, 48h)</option>
+      </select>
+      <label>Name (optional)</label>
+      <input name="name" type="text" placeholder="Dr. Jane Smith">
+      <label>Provider email (required)</label>
+      <input name="email" type="text" placeholder="jane@example.com">
+      <button type="submit">Create provider</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Providers</h2>
+    <form method="post" action="/admin/ui/list">
+      <label>Admin token</label>
+      <input name="token" type="password" placeholder="Your VAGIS_ADMIN_TOKEN" value="{tok}" autocomplete="off">
+      <button type="submit" class="secondary">Show list</button>
     </form>
   </div>
 </body></html>"""
 
 
-def _mode_label(mode: str) -> str:
-    return {"sleep": "Sleep", "rest": "Rest", "stand": "Stand",
-            "breathwork": "Breathwork"}.get(mode, mode.capitalize())
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page() -> HTMLResponse:
+    return HTMLResponse(_admin_page())
 
 
-def _portal_dashboard(rp: dict, key: str, cur, banner: str = "") -> str:
-    cur.execute(
-        "SELECT se_code, user_seq, label, email, created_at FROM subjects "
-        "WHERE rp_code = %s ORDER BY user_seq;", (rp["rp_code"],))
-    subs = cur.fetchall()
-    # Which modes each subject has uploaded.
-    cur.execute(
-        "SELECT enrollment_code, mode FROM metric_uploads WHERE enrollment_code IN "
-        "(SELECT se_code FROM subjects WHERE rp_code = %s);", (rp["rp_code"],))
-    modes_by_sub: dict[str, list[str]] = {}
-    for se, mode in cur.fetchall():
-        modes_by_sub.setdefault(se, []).append(mode)
+@app.post("/admin/ui/create", response_class=HTMLResponse)
+def admin_ui_create(token: str = Form(""), kind: str = Form("research"),
+                    name: str = Form(""), email: str = Form("")) -> HTMLResponse:
+    if token.strip() != (VAGIS_ADMIN_TOKEN or "").strip() or not VAGIS_ADMIN_TOKEN:
+        return HTMLResponse(_admin_page(token, '<div class="err">Admin token did not match.</div>'))
+    if kind not in PROVIDER_PREFIX:
+        return HTMLResponse(_admin_page(token, '<div class="err">Pick a valid system.</div>'))
+    if not email.strip():
+        return HTMLResponse(_admin_page(token, '<div class="err">A provider email is required.</div>'))
 
-    if subs:
-        rows = ""
-        for se_code, seq, label, email, created in subs:
-            has = sorted(modes_by_sub.get(se_code, []))
-            pills = "".join(f'<span class="pill">{_esc(_mode_label(m))}</span>' for m in has) \
-                    or '<span class="muted" style="margin-left:6px">no data yet</span>'
-            created_s = created.isoformat()[:10] if created else ""
-            meta = " &middot; ".join(x for x in [_esc(label) if label else "", _esc(email) if email else ""] if x)
-            rows += (
-                f'<div class="subrow"><div>'
-                f'<span class="mono">{_esc(se_code)}</span>'
-                f'{(" &middot; " + meta) if meta else ""}{pills}'
-                f'<div class="muted">issued {created_s}</div></div>'
-                f'<form class="inline" method="post" action="/portal/ui/subject">'
-                f'{_hidden_creds(rp["rp_code"], key)}'
-                f'<input type="hidden" name="se_code" value="{_esc(se_code)}">'
-                f'<button class="small" type="submit">View</button></form></div>'
-            )
-        subjects_block = rows
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            out = _issue_provider(cur, kind, name, email.strip())
+    finally:
+        conn.close()
+
+    sys_label = "research" if kind == "research" else "clinical"
+    portal_word = "subjects" if kind == "research" else "patients"
+    mail_body = (
+        f"Hello,\n\nYou have been set up as a {sys_label} provider on Vagis.\n\n"
+        f"Provider ID: {out['provider_code']}\nKey: {out['secret']}\n\n"
+        f"Sign in to the portal with these to manage your {portal_word} and view shared data. "
+        f"Keep the Key private.\n\nThanks."
+    )
+    badge = "res" if kind == "research" else "phy"
+    banner = (
+        '<div class="result">'
+        f'<div class="row"><span class="k">Provider ID <span class="badge {badge}">{sys_label}</span></span>'
+        f'<span class="v">{out["provider_code"]}</span></div>'
+        f'<div class="row"><span class="k">Key</span><span class="v">{out["secret"]}</span></div>'
+        f'<div class="row"><span class="k">Email</span><span class="v">{_esc(email.strip())}</span></div>'
+        '<div class="warn">The key is never shown again after you leave this page.</div>'
+        + _mailto(email.strip(), "Your Vagis provider access", mail_body, "Email this provider")
+        + '</div>'
+    )
+    return HTMLResponse(_admin_page(token, banner))
+
+
+@app.post("/admin/ui/list", response_class=HTMLResponse)
+def admin_ui_list(token: str = Form("")) -> HTMLResponse:
+    if token.strip() != (VAGIS_ADMIN_TOKEN or "").strip() or not VAGIS_ADMIN_TOKEN:
+        return HTMLResponse(_admin_page(token, '<div class="err">Admin token did not match.</div>'))
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            cur.execute(
+                "SELECT p.provider_code, p.kind, p.name, p.email, p.created_at, "
+                "(SELECT COUNT(*) FROM persons x WHERE x.provider_code = p.provider_code) "
+                "FROM providers p ORDER BY p.kind, p.seq;")
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        table = '<p class="muted">No providers yet.</p>'
     else:
-        subjects_block = '<p class="muted">No subjects yet. Issue a code below to add your first.</p>'
+        body = ""
+        for code, kind, name, email, created, n in rows:
+            badge = "res" if kind == "research" else "phy"
+            body += (f'<tr><td class="mono">{_esc(code)}</td>'
+                     f'<td><span class="badge {badge}">{_esc(kind)}</span></td>'
+                     f'<td>{_esc(name or "")}</td><td>{_esc(email or "")}</td>'
+                     f'<td>{n}</td><td>{created.isoformat()[:10] if created else ""}</td></tr>')
+        table = ('<div class="tablewrap"><table><thead><tr><th>Provider ID</th><th>System</th>'
+                 '<th>Name</th><th>Email</th><th>People</th><th>Created</th></tr></thead>'
+                 f'<tbody>{body}</tbody></table></div>')
+    banner = f'<div class="card"><h2>Providers ({len(rows)})</h2>{table}<a class="backbtn" href="/admin">&larr; Back</a></div>'
+    return HTMLResponse(_admin_page(token, banner))
 
+
+# ---- Portal --------------------------------------------------------------
+def _portal_login(banner: str = "") -> str:
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Vagis Researcher Portal</title>{_portal_style()}</head><body>
-  <h1>Vagis Researcher Portal</h1>
-  <p class="sub">Signed in as <span class="mono">{_esc(rp["rp_code"])}</span>{(" &middot; " + _esc(rp["name"])) if rp.get("name") else ""}</p>
+<title>Vagis Provider Portal</title>{_style()}</head><body>
+  <h1>Vagis Provider Portal</h1>
+  <p class="sub">Sign in to manage your people and view shared data.</p>
   {banner}
   <div class="card">
-    <h2>Issue a new subject code</h2>
-    <p class="muted">Creates the next code under your account. Email it to the subject to enrol them.</p>
-    <form method="post" action="/portal/ui/issue">
-      {_hidden_creds(rp["rp_code"], key)}
-      <label>Subject email (required)</label>
-      <input name="email" type="text" placeholder="subject@example.com">
-      <label>Label (optional, private to you)</label>
-      <input name="label" type="text" placeholder="e.g. pilot subject 1">
-      <div><button type="submit">Issue subject code</button></div>
+    <h2>Sign in</h2>
+    <form method="post" action="/portal/ui/dashboard">
+      <label>Provider ID</label>
+      <input name="provider_code" type="text" placeholder="e.g. RES001 or PHY001" autocomplete="off">
+      <label>Key</label>
+      <input name="key" type="password" placeholder="Your key" autocomplete="off">
+      <button type="submit">Sign in</button>
     </form>
-  </div>
-  <div class="card">
-    <h2>Your subjects ({len(subs)})</h2>
-    {subjects_block}
   </div>
 </body></html>"""
 
@@ -993,126 +838,208 @@ def portal_login_page() -> HTMLResponse:
     return HTMLResponse(_portal_login())
 
 
-def _auth_or_login(cur, rp_code: str, key: str):
-    """Return researcher dict, or None if credentials fail."""
-    try:
-        return authenticate_researcher(cur, rp_code, key)
-    except HTTPException:
-        return None
+def _portal_dashboard(prov: dict, key: str, cur, banner: str = "") -> str:
+    kind = prov["kind"]
+    is_research = kind == "research"
+    word = "subject" if is_research else "patient"
+    words = "subjects" if is_research else "patients"
+
+    cur.execute("SELECT person_code, person_seq, label, email, created_at FROM persons "
+                "WHERE provider_code = %s ORDER BY person_seq;", (prov["provider_code"],))
+    people = cur.fetchall()
+
+    # Which modes each person has, and (clinical) whether data is currently held.
+    if is_research:
+        cur.execute("SELECT person_code, mode FROM research_uploads WHERE person_code IN "
+                    "(SELECT person_code FROM persons WHERE provider_code = %s);", (prov["provider_code"],))
+    else:
+        purge_expired(cur)
+        cur.execute("SELECT person_code, mode FROM clinical_holds WHERE person_code IN "
+                    "(SELECT person_code FROM persons WHERE provider_code = %s);", (prov["provider_code"],))
+    modes_by: dict[str, list[str]] = {}
+    for pc, m in cur.fetchall():
+        modes_by.setdefault(pc, []).append(m)
+
+    if people:
+        rows = ""
+        for pcode, seq, label, email, created in people:
+            has = sorted(modes_by.get(pcode, []))
+            if has:
+                if is_research:
+                    marks = "".join(f'<span class="pill">{_esc(_mode_label(m))}</span>' for m in has)
+                else:
+                    marks = ('<span class="flag">NEW DATA</span>'
+                             + "".join(f'<span class="pill">{_esc(_mode_label(m))}</span>' for m in has))
+            else:
+                marks = '<span class="muted" style="margin-left:6px">no data</span>'
+            meta = " &middot; ".join(x for x in [_esc(label) if label else "", _esc(email) if email else ""] if x)
+            rows += (
+                f'<div class="subrow"><div><span class="mono">{_esc(pcode)}</span>'
+                f'{(" &middot; " + meta) if meta else ""}{marks}'
+                f'<div class="muted">issued {created.isoformat()[:10] if created else ""}</div></div>'
+                f'<form class="inline" method="post" action="/portal/ui/person">'
+                f'{_hidden(prov["provider_code"], key)}'
+                f'<input type="hidden" name="person_code" value="{_esc(pcode)}">'
+                f'<button class="small" type="submit">View</button></form></div>'
+            )
+        people_block = rows
+    else:
+        people_block = f'<p class="muted">No {words} yet. Issue a code below to add your first.</p>'
+
+    badge = "res" if is_research else "phy"
+    retention_note = ("Study data is stored persistently for your protocol."
+                      if is_research else
+                      f"Patient data is held only briefly and auto-deletes {CLINICAL_HOLD_HOURS}h after the patient sends it.")
+
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vagis Portal</title>{_style()}</head><body>
+  <h1>Vagis Portal <span class="badge {badge}">{_esc(kind)}</span></h1>
+  <p class="sub">Signed in as <span class="mono">{_esc(prov["provider_code"])}</span>{(" &middot; " + _esc(prov["name"])) if prov.get("name") else ""} &middot; {retention_note}</p>
+  {banner}
+  <div class="card">
+    <h2>Issue a new {word} code</h2>
+    <p class="muted">Creates the next code under your account. Email it to the {word} to enrol them.</p>
+    <form method="post" action="/portal/ui/issue">
+      {_hidden(prov["provider_code"], key)}
+      <label>{word.capitalize()} email (required)</label>
+      <input name="email" type="text" placeholder="{word}@example.com">
+      <label>Label (optional, private to you)</label>
+      <input name="label" type="text" placeholder="e.g. pilot {word} 1">
+      <button type="submit">Issue {word} code</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Your {words} ({len(people)})</h2>
+    {people_block}
+  </div>
+</body></html>"""
+
+
+def _auth_provider(cur, provider_code: str, key: str):
+    p = authenticate_provider(cur, provider_code, key)
+    if p:
+        # fetch name
+        cur.execute("SELECT name FROM providers WHERE provider_code = %s;", (p["provider_code"],))
+        row = cur.fetchone()
+        p["name"] = row[0] if row else None
+    return p
 
 
 @app.post("/portal/ui/dashboard", response_class=HTMLResponse)
-def portal_dashboard(rp_code: str = Form(""), key: str = Form("")) -> HTMLResponse:
+def portal_dashboard(provider_code: str = Form(""), key: str = Form("")) -> HTMLResponse:
     conn = db_connect()
     try:
         with conn, conn.cursor() as cur:
             ensure_tables(cur)
-            r = _auth_or_login(cur, rp_code, key)
-            if not r:
-                return HTMLResponse(_portal_login(
-                    '<div class="err">Wrong Researcher ID or Key.</div>'))
-            # fetch name for the header
-            cur.execute("SELECT name FROM researchers WHERE rp_code = %s;", (r["rp_code"],))
-            row = cur.fetchone()
-            r["name"] = row[0] if row else None
-            page = _portal_dashboard(r, key, cur)
+            p = _auth_provider(cur, provider_code, key)
+            if not p:
+                return HTMLResponse(_portal_login('<div class="err">Wrong Provider ID or Key.</div>'))
+            page = _portal_dashboard(p, key, cur)
     finally:
         conn.close()
     return HTMLResponse(page)
 
 
 @app.post("/portal/ui/issue", response_class=HTMLResponse)
-def portal_issue(rp_code: str = Form(""), key: str = Form(""),
+def portal_issue(provider_code: str = Form(""), key: str = Form(""),
                  label: str = Form(""), email: str = Form("")) -> HTMLResponse:
     conn = db_connect()
     try:
         with conn, conn.cursor() as cur:
             ensure_tables(cur)
-            r = _auth_or_login(cur, rp_code, key)
-            if not r:
-                return HTMLResponse(_portal_login('<div class="err">Wrong Researcher ID or Key.</div>'))
-            cur.execute("SELECT name FROM researchers WHERE rp_code = %s;", (r["rp_code"],))
-            nm = cur.fetchone()
-            r["name"] = nm[0] if nm else None
+            p = _auth_provider(cur, provider_code, key)
+            if not p:
+                return HTMLResponse(_portal_login('<div class="err">Wrong Provider ID or Key.</div>'))
+            word = "subject" if p["kind"] == "research" else "patient"
             if not email.strip():
-                return HTMLResponse(_portal_dashboard(r, key, cur,
-                    '<div class="err">A subject email is required.</div>'))
-            cur.execute("SELECT COALESCE(MAX(user_seq), 0) FROM subjects WHERE rp_code = %s;", (r["rp_code"],))
-            next_user = cur.fetchone()[0] + 1
-            if next_user > 9999:
-                return HTMLResponse(_portal_dashboard(r, key, cur,
-                    '<div class="err">Subject capacity reached (9999).</div>'))
-            se_code = make_se_code(r["rp_seq"], next_user)
-            cur.execute("INSERT INTO subjects (se_code, rp_code, user_seq, label, email) VALUES (%s,%s,%s,%s,%s);",
-                        (se_code, r["rp_code"], next_user, label or None, email.strip()))
+                return HTMLResponse(_portal_dashboard(p, key, cur,
+                    f'<div class="err">A {word} email is required.</div>'))
+            try:
+                out = _issue_person(cur, p, label, email.strip())
+            except HTTPException as e:
+                return HTMLResponse(_portal_dashboard(p, key, cur, f'<div class="err">{_esc(e.detail)}</div>'))
             mail_body = (
                 f"Hello,\n\nYou've been invited to share your Vagis data. Your enrollment code is:\n\n"
-                f"{se_code}\n\n"
+                f"{out['person_code']}\n\n"
                 f"Open the Vagis app, go to Data Share, enter this code, and follow the prompts. "
                 f"Only your metric summaries are shared \u2014 your raw recordings stay on your phone.\n\nThanks."
             )
             banner = (
                 '<div class="result">'
-                f'<div class="row"><span class="k">New subject code</span><span class="v">{_esc(se_code)}</span></div>'
+                f'<div class="row"><span class="k">New {word} code</span><span class="v">{_esc(out["person_code"])}</span></div>'
                 f'<div class="row"><span class="k">Email</span><span class="v">{_esc(email.strip())}</span></div>'
-                '<div class="warn">Send this code to the subject. They enter it in the app to share their data with you.</div>'
-                + _mailto_button(email.strip(), "Your Vagis enrollment code", mail_body, "Email this subject")
+                f'<div class="warn">Send this code to the {word}. They enter it in the app to share their data with you.</div>'
+                + _mailto(email.strip(), "Your Vagis enrollment code", mail_body, f"Email this {word}")
                 + '</div>'
             )
-            page = _portal_dashboard(r, key, cur, banner)
+            page = _portal_dashboard(p, key, cur, banner)
     finally:
         conn.close()
     return HTMLResponse(page)
 
 
-@app.post("/portal/ui/subject", response_class=HTMLResponse)
-def portal_subject(rp_code: str = Form(""), key: str = Form(""), se_code: str = Form("")) -> HTMLResponse:
+@app.post("/portal/ui/person", response_class=HTMLResponse)
+def portal_person(provider_code: str = Form(""), key: str = Form(""),
+                  person_code: str = Form("")) -> HTMLResponse:
     conn = db_connect()
     try:
         with conn, conn.cursor() as cur:
             ensure_tables(cur)
-            r = _auth_or_login(cur, rp_code, key)
-            if not r:
-                return HTMLResponse(_portal_login('<div class="err">Wrong Researcher ID or Key.</div>'))
-            se = (se_code or "").strip().upper()
-            # Verify this subject belongs to the signed-in researcher.
-            cur.execute("SELECT rp_code, label FROM subjects WHERE se_code = %s;", (se,))
+            p = _auth_provider(cur, provider_code, key)
+            if not p:
+                return HTMLResponse(_portal_login('<div class="err">Wrong Provider ID or Key.</div>'))
+            pc = (person_code or "").strip().upper()
+            cur.execute("SELECT provider_code, label FROM persons WHERE person_code = %s;", (pc,))
             row = cur.fetchone()
-            if not row or row[0] != r["rp_code"]:
-                return HTMLResponse(_portal_login('<div class="err">Subject not found under your account.</div>'))
+            if not row or row[0] != p["provider_code"]:
+                word = "subject" if p["kind"] == "research" else "patient"
+                return HTMLResponse(_portal_login(f'<div class="err">{word.capitalize()} not found under your account.</div>'))
             label = row[1]
-            cur.execute("SELECT mode, row_count, uploaded_at FROM metric_uploads "
-                        "WHERE enrollment_code = %s ORDER BY mode;", (se,))
+            if p["kind"] == "research":
+                cur.execute("SELECT mode, row_count, uploaded_at FROM research_uploads "
+                            "WHERE person_code = %s ORDER BY mode;", (pc,))
+                extra = ""
+            else:
+                purge_expired(cur)
+                cur.execute("SELECT mode, row_count, uploaded_at, expires_at FROM clinical_holds "
+                            "WHERE person_code = %s ORDER BY mode;", (pc,))
             uploads = cur.fetchall()
 
             if uploads:
                 items = ""
-                for mode, rc, up in uploads:
+                for u in uploads:
+                    mode, rc, up = u[0], u[1], u[2]
                     up_s = up.isoformat()[:16].replace("T", " ") if up else ""
+                    exp_note = ""
+                    if p["kind"] == "clinical":
+                        exp = u[3]
+                        exp_s = exp.isoformat()[:16].replace("T", " ") if exp else ""
+                        exp_note = f' &middot; auto-deletes {exp_s}'
                     items += (
                         f'<div class="subrow"><div><b>{_esc(_mode_label(mode))}</b>'
-                        f'<div class="muted">{rc if rc is not None else "?"} sessions &middot; updated {up_s}</div></div>'
+                        f'<div class="muted">{rc if rc is not None else "?"} sessions &middot; updated {up_s}{exp_note}</div></div>'
                         f'<form class="inline" method="post" action="/portal/ui/view">'
-                        f'{_hidden_creds(r["rp_code"], key)}'
-                        f'<input type="hidden" name="se_code" value="{_esc(se)}">'
+                        f'{_hidden(p["provider_code"], key)}'
+                        f'<input type="hidden" name="person_code" value="{_esc(pc)}">'
                         f'<input type="hidden" name="mode" value="{_esc(mode)}">'
                         f'<button class="small" type="submit">Open</button></form></div>'
                     )
-                modes_block = items
+                block = items
             else:
-                modes_block = '<p class="muted">This subject has not shared any data yet.</p>'
+                block = '<p class="muted">No data shared yet' + ('' if p["kind"] == "research" else ' (or it has expired)') + '.</p>'
 
             back = (f'<form class="inline" method="post" action="/portal/ui/dashboard">'
-                    f'{_hidden_creds(r["rp_code"], key)}'
-                    f'<button class="backbtn" type="submit">&larr; Back to subjects</button></form>')
-
+                    f'{_hidden(p["provider_code"], key)}'
+                    f'<button class="backbtn" type="submit">&larr; Back</button></form>')
+            word = "Subject" if p["kind"] == "research" else "Patient"
             page = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Subject {_esc(se)}</title>{_portal_style()}</head><body>
-  <h1>Subject <span class="mono">{_esc(se)}</span></h1>
-  <p class="sub">{_esc(label) if label else "No label"} &middot; researcher {_esc(r["rp_code"])}</p>
+<title>{word} {_esc(pc)}</title>{_style()}</head><body>
+  <h1>{word} <span class="mono">{_esc(pc)}</span></h1>
+  <p class="sub">{_esc(label) if label else "No label"} &middot; {_esc(p["provider_code"])}</p>
   {back}
-  <div class="card"><h2>Shared data</h2>{modes_block}</div>
+  <div class="card"><h2>Shared data</h2>{block}</div>
 </body></html>"""
     finally:
         conn.close()
@@ -1120,54 +1047,54 @@ def portal_subject(rp_code: str = Form(""), key: str = Form(""), se_code: str = 
 
 
 @app.post("/portal/ui/view", response_class=HTMLResponse)
-def portal_view(rp_code: str = Form(""), key: str = Form(""),
-                se_code: str = Form(""), mode: str = Form("")) -> HTMLResponse:
+def portal_view(provider_code: str = Form(""), key: str = Form(""),
+                person_code: str = Form(""), mode: str = Form("")) -> HTMLResponse:
     conn = db_connect()
     try:
         with conn, conn.cursor() as cur:
             ensure_tables(cur)
-            r = _auth_or_login(cur, rp_code, key)
-            if not r:
-                return HTMLResponse(_portal_login('<div class="err">Wrong Researcher ID or Key.</div>'))
-            se = (se_code or "").strip().upper()
+            p = _auth_provider(cur, provider_code, key)
+            if not p:
+                return HTMLResponse(_portal_login('<div class="err">Wrong Provider ID or Key.</div>'))
+            pc = (person_code or "").strip().upper()
             md = (mode or "").strip().lower()
-            # Ownership check again (never trust the posted se_code alone).
-            cur.execute("SELECT rp_code FROM subjects WHERE se_code = %s;", (se,))
+            cur.execute("SELECT provider_code FROM persons WHERE person_code = %s;", (pc,))
             own = cur.fetchone()
-            if not own or own[0] != r["rp_code"]:
-                return HTMLResponse(_portal_login('<div class="err">Subject not found under your account.</div>'))
-            cur.execute("SELECT csv_text FROM metric_uploads WHERE enrollment_code = %s AND mode = %s;", (se, md))
+            if not own or own[0] != p["provider_code"]:
+                return HTMLResponse(_portal_login('<div class="err">Not found under your account.</div>'))
+            if p["kind"] == "research":
+                cur.execute("SELECT csv_text FROM research_uploads WHERE person_code=%s AND mode=%s;", (pc, md))
+            else:
+                purge_expired(cur)
+                cur.execute("SELECT csv_text FROM clinical_holds WHERE person_code=%s AND mode=%s;", (pc, md))
             row = cur.fetchone()
     finally:
         conn.close()
 
-    back = (f'<form class="inline" method="post" action="/portal/ui/subject">'
-            f'{_hidden_creds(rp_code, key)}'
-            f'<input type="hidden" name="se_code" value="{_esc(se)}">'
-            f'<button class="backbtn" type="submit">&larr; Back to subject</button></form>')
+    back = (f'<form class="inline" method="post" action="/portal/ui/person">'
+            f'{_hidden(provider_code, key)}'
+            f'<input type="hidden" name="person_code" value="{_esc(person_code)}">'
+            f'<button class="backbtn" type="submit">&larr; Back</button></form>')
 
     if not row:
-        table = '<p class="muted">No data for this mode.</p>'
+        table = '<p class="muted">No data for this mode (it may have expired).</p>'
     else:
-        reader = _csv.reader(_io.StringIO(row[0]))
+        reader = csv.reader(io.StringIO(row[0]))
         all_rows = list(reader)
         if not all_rows:
             table = '<p class="muted">File is empty.</p>'
         else:
-            header = all_rows[0]
-            body_rows = all_rows[1:]
+            header, body_rows = all_rows[0], all_rows[1:]
             thead = "<tr>" + "".join(f"<th>{_esc(h)}</th>" for h in header) + "</tr>"
-            tbody = ""
-            for tr in body_rows:
-                tbody += "<tr>" + "".join(f'<td class="mono">{_esc(c)}</td>' for c in tr) + "</tr>"
+            tbody = "".join("<tr>" + "".join(f'<td class="mono">{_esc(c)}</td>' for c in r) + "</tr>" for r in body_rows)
             table = (f'<p class="muted">{len(body_rows)} sessions &middot; {len(header)} metrics &middot; view only</p>'
                      f'<div class="tablewrap"><table><thead>{thead}</thead><tbody>{tbody}</tbody></table></div>')
 
     page = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{_esc(_mode_label(md))} &middot; {_esc(se)}</title>{_portal_style()}</head><body>
+<title>{_esc(_mode_label(md))}</title>{_style()}</head><body>
   <h1>{_esc(_mode_label(md))} data</h1>
-  <p class="sub">Subject <span class="mono">{_esc(se)}</span></p>
+  <p class="sub"><span class="mono">{_esc(person_code)}</span></p>
   {back}
   <div class="card">{table}</div>
 </body></html>"""
