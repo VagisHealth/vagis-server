@@ -1775,12 +1775,14 @@ def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
     figure_ids: list[str] = []
     container_id = None
     text_parts: list[str] = []
+    CONTINUE_REASONS = {"pause_turn", "tool_use"}
 
-    # Tool-use loop: code execution runs server-side on Anthropic's side; we may
-    # need to continue the turn on a pause_turn stop reason. Each call carries an
-    # explicit timeout so a stuck turn returns an error instead of hanging forever.
+    # Tool-use loop: code execution runs server-side on Anthropic's side. A turn
+    # that is still working reports stop_reason "pause_turn" or "tool_use"; we feed
+    # the assistant turn back and continue until it reaches a final stop reason and
+    # produces its closing text. Each call carries a timeout so nothing hangs.
     try:
-        for _ in range(8):  # safety bound on turn continuations
+        for _ in range(10):  # safety bound on continuations
             kwargs = dict(model=MODEL, max_tokens=AGENT_MAX_TOKENS,
                           system=system, messages=messages, tools=[CODE_EXEC_TOOL])
             if container_id:
@@ -1794,8 +1796,8 @@ def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
             if t:
                 text_parts.append(t)
 
-            if getattr(m, "stop_reason", None) == "pause_turn":
-                # Feed the paused assistant turn back verbatim to continue it.
+            if getattr(m, "stop_reason", None) in CONTINUE_REASONS:
+                # Feed the assistant turn back verbatim so it can continue.
                 messages.append({"role": "assistant", "content": m.content})
                 continue
             break
@@ -1812,7 +1814,12 @@ def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream error: {type(e).__name__}")
 
-    reply = "\n\n".join(p for p in text_parts if p).strip() or "(no reply)"
+    reply = "\n\n".join(p for p in text_parts if p).strip()
+    if not reply:
+        # Work may have happened (figures) but no closing text came through.
+        reply = ("The analysis ran but didn't return a written summary. "
+                 "Please try again, or rephrase the request more specifically."
+                 if figure_ids else "(no reply)")
     return {"reply": reply, "figures": figure_ids,
             "container": container_id, "has_analysis": bool(figure_ids)}
 
