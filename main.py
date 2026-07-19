@@ -1797,16 +1797,6 @@ def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
                 kwargs["container"] = container_id
             m = client.with_options(timeout=170.0).messages.create(**kwargs)
 
-            # --- diagnostics (temporary) ---
-            try:
-                block_types = [getattr(b, "type", "?") for b in m.content]
-                print(f"[agent] iter={_i} stop={getattr(m,'stop_reason',None)} "
-                      f"blocks={block_types} figs+={_extract_figure_ids(m.content)} "
-                      f"text_len={len(_extract_text(m.content))}", flush=True)
-            except Exception as _e:
-                print(f"[agent] iter={_i} diag-error {type(_e).__name__}: {_e}", flush=True)
-            # --- end diagnostics ---
-
             if getattr(m, "container", None):
                 container_id = m.container.id
             figure_ids += _extract_figure_ids(m.content)
