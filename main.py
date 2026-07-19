@@ -838,7 +838,302 @@ def portal_login_page() -> HTMLResponse:
     return HTMLResponse(_portal_login())
 
 
+
+def _research_style() -> str:
+    return """
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         margin: 0; background: #f4f6f8; color: #1a2b34; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 16px; }
+  .topbar { display:flex; align-items:center; justify-content:space-between;
+            background:#fff; border:0.5px solid #e2e6ea; border-radius:10px; padding:11px 16px; margin-bottom:12px; }
+  .brand { display:flex; align-items:center; gap:9px; font-size:16px; font-weight:600; }
+  .brand .logo { width:26px;height:26px;border-radius:6px;background:#1d6fa5;color:#fff;
+                 display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700; }
+  .tag { font-size:11px;color:#0c447c;background:#e6f1fb;border-radius:5px;padding:2px 8px;font-weight:500; }
+  .who { font-size:12px;color:#5f6b72; }
+  .banner { background:#e1f5ee;border:1px solid #9fe1cb;border-radius:9px;padding:12px 14px;margin-bottom:12px;
+            font-size:14px;color:#085041; }
+  .banner .v { font-family:ui-monospace,Menlo,monospace;font-weight:600; }
+  .grid { display:grid; grid-template-columns:120px 150px 1fr; gap:10px; align-items:start; }
+  .card { background:#fff; border:0.5px solid #e2e6ea; border-radius:10px; padding:11px; }
+  .lbl { font-size:10px;font-weight:600;color:#5f6b72;text-transform:uppercase;letter-spacing:.3px;margin-bottom:8px; }
+  .subjlist { display:flex; flex-direction:column; gap:2px; max-height:520px; overflow-y:auto; }
+  .subj { font-family:ui-monospace,Menlo,monospace; font-size:11px; color:#3a4750;
+          padding:4px 6px; border-radius:4px; cursor:pointer; user-select:none; }
+  .subj:hover { background:#f0f4f7; }
+  .subj.sel { background:#eef6fc; color:#12456e; font-weight:600; }
+  .box { margin-bottom:9px; }
+  .box .hd { display:flex;align-items:center;justify-content:space-between;margin-bottom:6px; }
+  .box .hd .name { font-size:11px;font-weight:600; }
+  .box .hd .btns { display:flex;gap:4px; }
+  .minibtn { font-size:10px; border:0.5px solid #ccd4da; background:#fff; border-radius:5px;
+             padding:2px 6px; cursor:pointer; color:#3a4750; }
+  .minibtn:hover { background:#f0f4f7; }
+  .g1 { border:0.5px solid #cfe0ee; }
+  .g2 { border:0.5px solid #d8e6d4; }
+  .chip { font-family:ui-monospace,Menlo,monospace; font-size:10.5px; border-radius:4px;
+          padding:3px 6px; margin-bottom:3px; display:flex; align-items:center; justify-content:space-between; }
+  .g1 .chip { background:#f4f9fd; color:#12456e; }
+  .g2 .chip { background:#f4faef; color:#2f5410; }
+  .ind .chip { background:#f2f4f6; color:#2c3940; }
+  .chip .rm { cursor:pointer; color:#c0392b; font-weight:700; margin-left:6px; }
+  .drop { border:1px dashed #d5dbe0; border-radius:5px; padding:6px; text-align:center;
+          font-size:10px; color:#93a0a8; cursor:text; }
+  .agent { display:flex; flex-direction:column; min-height:540px; }
+  .msgs { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:9px; padding:2px; max-height:470px; }
+  .msg { border-radius:9px; padding:10px 13px; font-size:13.5px; line-height:1.5; max-width:82%; white-space:pre-wrap; }
+  .msg.user { background:#eef6fc; color:#12456e; align-self:flex-end; }
+  .msg.bot { background:#f6f7f8; color:#2c3940; align-self:flex-start; }
+  .msg.think { color:#93a0a8; font-style:italic; }
+  .composer { display:flex; gap:8px; margin-top:11px; }
+  .composer textarea { flex:1; border:0.5px solid #e2e6ea; border-radius:9px; padding:10px 12px;
+          font-size:13.5px; font-family:inherit; resize:none; height:42px; }
+  .send { width:42px; height:42px; background:#1d6fa5; border:none; border-radius:9px; color:#fff;
+          font-size:18px; cursor:pointer; }
+  .send:disabled { opacity:.5; cursor:default; }
+  .issue { display:flex; gap:6px; align-items:center; margin-top:9px; flex-wrap:wrap; }
+  .issue input { border:0.5px solid #e2e6ea; border-radius:6px; padding:6px 8px; font-size:12px; }
+  .issue button { background:#1d6fa5;color:#fff;border:none;border-radius:6px;padding:6px 11px;font-size:12px;cursor:pointer; }
+  .hint { font-size:10px;color:#93a0a8;margin-top:6px;text-align:center; }
+</style>
+"""
+
+_RESEARCH_BODY = r"""
+<div class="wrap">
+  <div class="topbar">
+    <div class="brand"><span class="logo">V</span> Vagis Research Portal <span class="tag">research</span></div>
+    <div class="who" id="who"></div>
+  </div>
+  <div id="banner"></div>
+  <div class="grid">
+
+    <div class="card">
+      <div class="lbl">Subjects</div>
+      <div class="subjlist" id="subjlist"></div>
+      <form method="post" action="/portal/ui/issue" class="issue" id="issueForm">
+        <input type="hidden" name="provider_code" id="pcField">
+        <input type="hidden" name="key" id="keyField">
+        <input type="text" name="email" placeholder="new subject email" style="width:100%">
+        <input type="text" name="label" placeholder="label (optional)" style="width:100%">
+        <button type="submit">Issue code</button>
+      </form>
+    </div>
+
+    <div>
+      <div class="card box ind">
+        <div class="hd"><span class="name">Individual</span>
+          <span class="btns"><button class="minibtn" onclick="addSel('individual')">&rarr;</button>
+          <button class="minibtn" onclick="clearBox('individual')">clear</button></span></div>
+        <div id="individual"></div>
+        <div class="drop" data-box="individual">click a subject then &rarr;, or paste</div>
+      </div>
+      <div class="card box g1">
+        <div class="hd"><span class="name" style="color:#185fa5">Group 1</span>
+          <span class="btns"><button class="minibtn" onclick="addSel('group1')">&rarr;</button>
+          <button class="minibtn" onclick="clearBox('group1')">clear</button></span></div>
+        <div id="group1"></div>
+        <div class="drop" data-box="group1">add or paste subjects</div>
+      </div>
+      <div class="card box g2">
+        <div class="hd"><span class="name" style="color:#3b6d11">Group 2</span>
+          <span class="btns"><button class="minibtn" onclick="addSel('group2')">&rarr;</button>
+          <button class="minibtn" onclick="clearBox('group2')">clear</button></span></div>
+        <div id="group2"></div>
+        <div class="drop" data-box="group2">add or paste subjects</div>
+      </div>
+    </div>
+
+    <div class="card agent">
+      <div class="lbl">Analysis agent</div>
+      <div class="msgs" id="msgs"></div>
+      <div class="composer">
+        <textarea id="input" placeholder="Ask the agent to analyze the individual or compare groups..."></textarea>
+        <button class="send" id="sendBtn" onclick="send()">&uarr;</button>
+      </div>
+      <div class="hint">Preview: the agent is connected. Live statistics and figures are being added next.</div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const boxes = { individual: [], group1: [], group2: [] };
+let selected = null;
+const conversation = [];
+
+document.getElementById('who').textContent = PROVIDER + (PROVNAME ? '  \u00b7  ' + PROVNAME : '');
+document.getElementById('pcField').value = PROVIDER;
+document.getElementById('keyField').value = KEY;
+
+function knownCode(code) { return SUBJECTS.some(function(s){ return s.code === code; }); }
+
+function renderList() {
+  const el = document.getElementById('subjlist');
+  el.innerHTML = '';
+  SUBJECTS.forEach(function(s) {
+    const d = document.createElement('div');
+    d.className = 'subj' + (selected === s.code ? ' sel' : '');
+    d.textContent = s.code;
+    d.title = s.label || '';
+    d.onclick = function(){ selected = (selected === s.code ? null : s.code); renderList(); };
+    el.appendChild(d);
+  });
+}
+
+function inOtherBox(code, box) {
+  return Object.keys(boxes).some(function(b){ return b !== box && boxes[b].indexOf(code) !== -1; });
+}
+
+function addCode(box, code) {
+  code = (code || '').trim().toUpperCase();
+  if (!code || !knownCode(code)) return false;
+  Object.keys(boxes).forEach(function(b){
+    const i = boxes[b].indexOf(code);
+    if (i !== -1) boxes[b].splice(i, 1);
+  });
+  if (box === 'individual') boxes.individual = [code];
+  else if (boxes[box].indexOf(code) === -1) boxes[box].push(code);
+  return true;
+}
+
+function addSel(box) {
+  if (!selected) return;
+  addCode(box, selected);
+  selected = null;
+  renderAll();
+}
+
+function removeCode(box, code) {
+  const i = boxes[box].indexOf(code);
+  if (i !== -1) boxes[box].splice(i, 1);
+  renderAll();
+}
+
+function clearBox(box) { boxes[box] = []; renderAll(); }
+
+function parsePaste(text) {
+  return (text || '').split(/[\s,;]+/).map(function(x){ return x.trim().toUpperCase(); }).filter(Boolean);
+}
+
+function renderBox(box) {
+  const el = document.getElementById(box);
+  el.innerHTML = '';
+  boxes[box].forEach(function(code) {
+    const c = document.createElement('div');
+    c.className = 'chip';
+    const span = document.createElement('span');
+    span.textContent = code;
+    const rm = document.createElement('span');
+    rm.className = 'rm';
+    rm.textContent = '\u00d7';
+    rm.onclick = function(){ removeCode(box, code); };
+    c.appendChild(span); c.appendChild(rm);
+    el.appendChild(c);
+  });
+}
+
+function renderAll() { renderList(); ['individual','group1','group2'].forEach(renderBox); }
+
+document.querySelectorAll('.drop').forEach(function(d) {
+  d.addEventListener('paste', function(e) {
+    e.preventDefault();
+    const box = d.getAttribute('data-box');
+    const text = (e.clipboardData || window.clipboardData).getData('text');
+    let added = 0;
+    parsePaste(text).forEach(function(code){ if (addCode(box, code)) added++; });
+    renderAll();
+  });
+});
+
+function groupsPayload() {
+  return { individual: boxes.individual.slice(), group1: boxes.group1.slice(), group2: boxes.group2.slice() };
+}
+
+function addMsg(role, text, cls) {
+  const m = document.createElement('div');
+  m.className = 'msg ' + (cls || role);
+  m.textContent = text;
+  document.getElementById('msgs').appendChild(m);
+  const box = document.getElementById('msgs');
+  box.scrollTop = box.scrollHeight;
+  return m;
+}
+
+async function send() {
+  const inp = document.getElementById('input');
+  const msg = inp.value.trim();
+  if (!msg) return;
+  inp.value = '';
+  const btn = document.getElementById('sendBtn');
+  btn.disabled = true;
+  addMsg('user', msg);
+  conversation.push({ role: 'user', content: msg });
+  const thinking = addMsg('bot', 'Thinking...', 'bot think');
+  try {
+    const res = await fetch('/portal/agent/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider_code: PROVIDER, key: KEY, message: msg,
+                             history: conversation, groups: groupsPayload() })
+    });
+    const data = await res.json();
+    thinking.remove();
+    const reply = (data && data.reply) ? data.reply : (data && data.detail ? data.detail : 'No response.');
+    addMsg('bot', reply);
+    conversation.push({ role: 'assistant', content: reply });
+  } catch (e) {
+    thinking.remove();
+    addMsg('bot', 'Could not reach the agent: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById('input').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+
+renderAll();
+</script>
+</body></html>
+"""
+
+def _research_dashboard(prov: dict, key: str, cur, banner: str = "") -> str:
+    """Rich research analysis workspace: thin subject list, Individual/Group1/Group2
+    boxes with click-to-add + paste, and a live agent chat panel."""
+    import json as _json
+    cur.execute("SELECT person_code, label FROM persons WHERE provider_code = %s AND kind='research' "
+                "ORDER BY person_seq;", (prov["provider_code"],))
+    rows = cur.fetchall()
+    subjects = [{"code": r[0], "label": r[1] or ""} for r in rows]
+    subjects_json = _json.dumps(subjects)
+    prov_code = prov["provider_code"]
+    name = prov.get("name") or ""
+
+    head = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vagis Research Portal</title>{_research_style()}</head><body>
+<script>
+const SUBJECTS = {subjects_json};
+const PROVIDER = {_json.dumps(prov_code)};
+const KEY = {_json.dumps(key)};
+const PROVNAME = {_json.dumps(name)};
+</script>
+"""
+    return head + _RESEARCH_BODY
+
+
 def _portal_dashboard(prov: dict, key: str, cur, banner: str = "") -> str:
+    """Dispatch: research providers get the rich analysis workspace;
+    clinical providers keep the plain dashboard for now."""
+    if prov["kind"] == "research":
+        return _research_dashboard(prov, key, cur, banner)
+    return _plain_dashboard(prov, key, cur, banner)
+
+
+def _plain_dashboard(prov: dict, key: str, cur, banner: str = "") -> str:
     kind = prov["kind"]
     is_research = kind == "research"
     word = "subject" if is_research else "patient"
@@ -1099,3 +1394,84 @@ def portal_view(provider_code: str = Form(""), key: str = Form(""),
   <div class="card">{table}</div>
 </body></html>"""
     return HTMLResponse(page)
+
+
+# --------------------------------------------------------------------------
+# Research analysis agent  (Stage 1: live agent pipe, no code execution yet)
+# --------------------------------------------------------------------------
+class AgentChatRequest(BaseModel):
+    provider_code: str
+    key: str
+    message: str
+    history: list[dict[str, Any]] = Field(default_factory=list)
+    groups: dict[str, list[str]] = Field(default_factory=dict)
+
+
+def _research_agent_system(groups: dict[str, list[str]]) -> str:
+    ind = groups.get("individual", []) or []
+    g1 = groups.get("group1", []) or []
+    g2 = groups.get("group2", []) or []
+    sel = []
+    if ind: sel.append(f"Individual: {', '.join(ind)}")
+    if g1:  sel.append(f"Group 1: {', '.join(g1)}")
+    if g2:  sel.append(f"Group 2: {', '.join(g2)}")
+    sel_block = "\n".join(sel) if sel else "No subjects are selected yet."
+    return (
+        "You are the Vagis research analysis assistant, helping a researcher analyze "
+        "autonomic-metric data collected from study subjects via a smart ring. You speak "
+        "to a professional researcher, so you can be technical and precise.\n\n"
+        "IMPORTANT — current capability: this is an early preview. You can discuss study "
+        "design, explain which statistical tests fit a question, and describe what analysis "
+        "you would run. But you do NOT yet have the subjects' actual data loaded, and you "
+        "cannot yet execute code or compute real statistics or figures. If asked to run a "
+        "specific test, briefly say what you would do and note that live data-connected "
+        "analysis is being added next — do NOT fabricate numbers, p-values, or results.\n\n"
+        "The researcher has currently selected:\n" + sel_block + "\n\n"
+        "The researcher is responsible for which subject codes belong to which group. "
+        "Keep replies concise and useful."
+    )
+
+
+@app.post("/portal/agent/chat")
+def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
+    """Live agent pipe for the research portal. Authenticated by provider_code+key.
+    Stage 1: real Claude reply, no data/code-execution yet."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=500, detail="Anthropic key not configured.")
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            prov = authenticate_provider(cur, req.provider_code, req.key)
+    finally:
+        conn.close()
+    if not prov or prov["kind"] != "research":
+        raise HTTPException(status_code=401, detail="Not authorized for the research agent.")
+
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="Empty message.")
+
+    # Build conversation from history (already includes the latest user turn).
+    messages = []
+    for turn in req.history[-20:]:
+        role = turn.get("role")
+        content = turn.get("content", "")
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+    if not messages:
+        messages = [{"role": "user", "content": req.message}]
+
+    try:
+        m = client.messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            system=_research_agent_system(req.groups),
+            messages=messages,
+        )
+    except anthropic.APIStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Anthropic error: {e.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Upstream error: {type(e).__name__}")
+
+    reply = "".join(b.text for b in m.content if getattr(b, "type", None) == "text").strip()
+    return {"reply": reply or "(no reply)"}
