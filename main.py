@@ -900,6 +900,13 @@ def _research_style() -> str:
   .msg.user { background:#eef6fc; color:#12456e; align-self:flex-end; }
   .msg.bot { background:#f6f7f8; color:#2c3940; align-self:flex-start; }
   .msg.think { color:#93a0a8; font-style:italic; }
+  .figwrap { padding:6px !important; background:#fff !important; border:0.5px solid #e2e6ea; max-width:92% !important; }
+  .figimg { max-width:100%; border-radius:6px; display:block; }
+  .dlrow { background:none !important; padding:2px !important; }
+  .dlbtn { background:#1d6fa5; color:#fff; border:none; border-radius:8px; padding:9px 14px;
+           font-size:12.5px; font-weight:500; cursor:pointer; }
+  .dlbtn:hover { background:#185f90; }
+  .dlbtn:disabled { opacity:.6; cursor:default; }
   .composer { display:flex; gap:8px; margin-top:11px; }
   .composer textarea { flex:1; border:0.5px solid #e2e6ea; border-radius:9px; padding:10px 12px;
           font-size:13.5px; font-family:inherit; resize:none; height:42px; }
@@ -1153,6 +1160,53 @@ function addMsg(role, text, cls) {
   return m;
 }
 
+function addFigure(fileId) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg bot figwrap';
+  const img = document.createElement('img');
+  img.className = 'figimg';
+  img.alt = 'analysis figure';
+  // Fetch the figure with auth, show as blob.
+  fetch('/portal/agent/figure', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider_code: PROVIDER, key: KEY, file_id: fileId })
+  }).then(function(r){ return r.ok ? r.blob() : null; })
+    .then(function(b){ if (b) img.src = URL.createObjectURL(b); else wrap.remove(); })
+    .catch(function(){ wrap.remove(); });
+  wrap.appendChild(img);
+  document.getElementById('msgs').appendChild(wrap);
+  const box = document.getElementById('msgs');
+  box.scrollTop = box.scrollHeight;
+}
+
+function addSummaryButton(replyText, figureIds) {
+  const row = document.createElement('div');
+  row.className = 'msg bot dlrow';
+  const btn = document.createElement('button');
+  btn.className = 'dlbtn';
+  btn.textContent = 'Download summary (PDF)';
+  btn.onclick = function() {
+    btn.disabled = true; btn.textContent = 'Preparing...';
+    fetch('/portal/agent/summary', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider_code: PROVIDER, key: KEY,
+                             title: 'Vagis analysis summary', text: replyText, figure_ids: figureIds })
+    }).then(function(r){ return r.ok ? r.blob() : null; })
+      .then(function(b){
+        btn.disabled = false; btn.textContent = 'Download summary (PDF)';
+        if (!b) return;
+        const url = URL.createObjectURL(b);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'vagis_analysis_summary.pdf'; a.click();
+        URL.revokeObjectURL(url);
+      }).catch(function(){ btn.disabled = false; btn.textContent = 'Download summary (PDF)'; });
+  };
+  row.appendChild(btn);
+  document.getElementById('msgs').appendChild(row);
+  const box = document.getElementById('msgs');
+  box.scrollTop = box.scrollHeight;
+}
+
 async function send() {
   const inp = document.getElementById('input');
   const msg = inp.value.trim();
@@ -1162,7 +1216,7 @@ async function send() {
   btn.disabled = true;
   addMsg('user', msg);
   conversation.push({ role: 'user', content: msg });
-  const thinking = addMsg('bot', 'Thinking...', 'bot think');
+  const thinking = addMsg('bot', 'Analyzing...', 'bot think');
   try {
     const res = await fetch('/portal/agent/chat', {
       method: 'POST',
@@ -1176,6 +1230,9 @@ async function send() {
     const reply = (data && data.reply) ? data.reply : (data && data.detail ? data.detail : 'No response.');
     addMsg('bot', reply);
     conversation.push({ role: 'assistant', content: reply });
+    const figs = (data && data.figures) ? data.figures : [];
+    figs.forEach(addFigure);
+    if (figs.length) addSummaryButton(reply, figs);
   } catch (e) {
     thinking.remove();
     addMsg('bot', 'Could not reach the agent: ' + e.message);
@@ -1619,30 +1676,69 @@ def _research_agent_system(groups: dict[str, list[str]], mode: str,
             "The selected subjects' data is provided below. For an Individual, all four "
             "recording modes are included; for a group comparison, the chosen mode is "
             "included for every subject.\n\n"
-            "IMPORTANT — how to use it: you can read and reason over this data to describe "
-            "patterns, differences, and trends, and give approximate figures. But you are "
-            "READING numbers, not executing code, so do NOT present precise statistics, "
-            "p-values, or exact test results as if computed — approximate and clearly say so. "
-            "Formal computed tests and publication figures are being added next (they will "
-            "run real code). Never fabricate values that aren't supported by the data shown.\n"
+            "YOU HAVE A PYTHON CODE-EXECUTION TOOL. When the researcher asks for a "
+            "statistical test, comparison, or figure, USE IT to compute real results on the "
+            "data above (pandas, numpy, scipy, statsmodels, matplotlib, seaborn are "
+            "available). Parse the data blocks into DataFrames and run exactly the analysis "
+            "the researcher prescribes — they own the statistical choice; execute it "
+            "faithfully rather than substituting your own.\n\n"
+            "HOW TO REPORT — this is important:\n"
+            "- The researcher is a scientist who wants RESULTS, not code. NEVER show, print, "
+            "or describe the code you ran. Present only a clear, plain-language summary of "
+            "what was done and what was found.\n"
+            "- Report the real computed numbers: test used, n per group, group means ± SD, "
+            "the statistic, p-value, and an effect size where appropriate. State them plainly.\n"
+            "- When you create a figure, save it as a PNG. Put the KEY STATISTICS ON THE "
+            "FIGURE ITSELF where sensible (p-value, group means, error bars, n per group) and "
+            "give it clear axis labels and a short title, so it is publication-usable and "
+            "self-contained.\n"
+            "- Do NOT fabricate anything. Only report what the computation actually produced. "
+            "If the data can't support the requested test (e.g. too few subjects), say so "
+            "plainly rather than forcing a result.\n"
         )
         if used_summary:
-            cap += ("\nNote: the raw data was large, so per-column SUMMARIES (n, mean, sd, "
-                    "min, max) are shown instead of raw rows for this request.\n")
+            cap += ("\nNote: the data was large, so per-column SUMMARIES (n, mean, sd, min, "
+                    "max) are provided instead of raw rows. You can reason over these but "
+                    "cannot run per-session tests on summarized data — say so if a test needs "
+                    "raw rows.\n")
         return base + cap + "\n" + data_block
     else:
         return base + (
             "No subject data is loaded for this request (nothing selected, or the selected "
-            "subjects have no uploaded data for the chosen mode). You can still discuss study "
-            "design and which tests would fit — but do NOT fabricate numbers or results."
+            "subjects have no uploaded data for the chosen mode). You can discuss study design "
+            "and which tests would fit — but do NOT run code or fabricate numbers."
         )
+
+
+CODE_EXEC_TOOL = {"type": "code_execution_20250825", "name": "code_execution"}
+AGENT_MAX_TOKENS = int(os.environ.get("VAGIS_AGENT_MAX_TOKENS", "4096"))
+
+
+def _extract_text(content) -> str:
+    return "".join(b.text for b in content if getattr(b, "type", None) == "text").strip()
+
+
+def _extract_figure_ids(content) -> list[str]:
+    """Pull file_ids for any files the code execution created (e.g. saved PNGs)."""
+    ids = []
+    for b in content:
+        if getattr(b, "type", None) == "bash_code_execution_tool_result":
+            inner = getattr(b, "content", None)
+            files = getattr(inner, "content", None) if inner is not None else None
+            if files:
+                for fb in files:
+                    fid = getattr(fb, "file_id", None)
+                    if fid:
+                        ids.append(fid)
+    return ids
 
 
 @app.post("/portal/agent/chat")
 def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
-    """Live agent pipe for the research portal. Authenticated by provider_code+key.
-    Stage 2: the selected subjects' real data is loaded into the agent's context
-    (individual = all modes; group comparison = the chosen mode). No code execution yet."""
+    """Research analysis agent. Authenticated by provider_code+key. Stage 3: the
+    agent runs real Python (code execution) on the selected subjects' data to
+    compute prescribed statistics and generate figures. It reports plain-language
+    results only (never code); figures are returned as downloadable images."""
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=500, detail="Anthropic key not configured.")
     if not req.message.strip():
@@ -1655,7 +1751,6 @@ def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
             prov = authenticate_provider(cur, req.provider_code, req.key)
             if not prov or prov["kind"] != "research":
                 raise HTTPException(status_code=401, detail="Not authorized for the research agent.")
-            # Only fetch data for subjects that actually belong to this provider.
             owned = _owned_selection(cur, prov["provider_code"], req.groups)
             data_block, used_summary = _build_data_context(cur, owned, req.mode)
     finally:
@@ -1672,20 +1767,40 @@ def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
     if not messages:
         messages = [{"role": "user", "content": req.message}]
 
+    figure_ids: list[str] = []
+    container_id = None
+    text_parts: list[str] = []
+
+    # Tool-use loop: code execution runs server-side on Anthropic's side; we may
+    # need to continue the turn on a pause_turn stop reason.
     try:
-        m = client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            system=system,
-            messages=messages,
-        )
+        for _ in range(8):  # safety bound on turn continuations
+            kwargs = dict(model=MODEL, max_tokens=AGENT_MAX_TOKENS,
+                          system=system, messages=messages, tools=[CODE_EXEC_TOOL])
+            if container_id:
+                kwargs["container"] = container_id
+            m = client.messages.create(**kwargs)
+
+            if getattr(m, "container", None):
+                container_id = m.container.id
+            figure_ids += _extract_figure_ids(m.content)
+            t = _extract_text(m.content)
+            if t:
+                text_parts.append(t)
+
+            if getattr(m, "stop_reason", None) == "pause_turn":
+                # Feed the paused turn back to let the agent continue.
+                messages.append({"role": "assistant", "content": m.content})
+                continue
+            break
     except anthropic.APIStatusError as e:
         raise HTTPException(status_code=502, detail=f"Anthropic error: {e.status_code}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream error: {type(e).__name__}")
 
-    reply = "".join(b.text for b in m.content if getattr(b, "type", None) == "text").strip()
-    return {"reply": reply or "(no reply)"}
+    reply = "\n\n".join(p for p in text_parts if p).strip() or "(no reply)"
+    return {"reply": reply, "figures": figure_ids,
+            "container": container_id, "has_analysis": bool(figure_ids)}
 
 
 def _owned_selection(cur, provider_code: str, groups: dict[str, list[str]]) -> dict[str, list[str]]:
@@ -1699,3 +1814,132 @@ def _owned_selection(cur, provider_code: str, groups: dict[str, list[str]]) -> d
         codes = [c.strip().upper() for c in (groups.get(box) or [])]
         out[box] = [c for c in codes if c in mine]
     return out
+
+
+def _provider_ok(provider_code: str, key: str) -> bool:
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            prov = authenticate_provider(cur, provider_code, key)
+            return bool(prov and prov["kind"] == "research")
+    finally:
+        conn.close()
+
+
+class FigureRequest(BaseModel):
+    provider_code: str
+    key: str
+    file_id: str
+
+
+@app.post("/portal/agent/figure")
+def research_agent_figure(req: FigureRequest):
+    """Stream a figure the code execution produced, by its Files API id.
+    Authenticated by provider key so figures aren't world-readable."""
+    from fastapi.responses import Response
+    if not _provider_ok(req.provider_code, req.key):
+        raise HTTPException(status_code=401, detail="Not authorized.")
+    try:
+        data = client.beta.files.download(req.file_id)
+        raw = data.read() if hasattr(data, "read") else bytes(data)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Figure not available.")
+    return Response(content=raw, media_type="image/png")
+
+
+class SummaryRequest(BaseModel):
+    provider_code: str
+    key: str
+    title: str = "Vagis analysis summary"
+    text: str = ""
+    figure_ids: list[str] = Field(default_factory=list)
+
+
+@app.post("/portal/agent/summary")
+def research_agent_summary(req: SummaryRequest):
+    """Assemble a PDF summary (plain-language results + figures) for download.
+    Built server-side from the agent's reply text and the figures it generated."""
+    from fastapi.responses import Response
+    if not _provider_ok(req.provider_code, req.key):
+        raise HTTPException(status_code=401, detail="Not authorized.")
+
+    imgs = []
+    for fid in req.figure_ids[:12]:
+        try:
+            d = client.beta.files.download(fid)
+            imgs.append(d.read() if hasattr(d, "read") else bytes(d))
+        except Exception:
+            pass
+
+    try:
+        pdf_bytes = _build_summary_pdf(req.title, req.text, imgs)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not build summary: {type(e).__name__}")
+
+    return Response(content=pdf_bytes, media_type="application/pdf",
+                    headers={"Content-Disposition": 'attachment; filename="vagis_analysis_summary.pdf"'})
+
+
+def _build_summary_pdf(title: str, text: str, images: list[bytes]) -> bytes:
+    """Compose a simple PDF: title, plain-language results, then figures."""
+    import io as _io
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.units import inch
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas as _canvas
+    from datetime import datetime as _dt
+
+    buf = _io.BytesIO()
+    c = _canvas.Canvas(buf, pagesize=letter)
+    W, H = letter
+    margin = 0.9 * inch
+    y = H - margin
+
+    c.setFont("Helvetica-Bold", 15)
+    c.drawString(margin, y, title[:90]); y -= 20
+    c.setFont("Helvetica", 9)
+    c.setFillGray(0.4)
+    c.drawString(margin, y, "Generated by Vagis · " + _dt.utcnow().strftime("%Y-%m-%d %H:%M UTC"))
+    c.setFillGray(0); y -= 22
+
+    c.setFont("Helvetica", 10.5)
+    max_w = W - 2 * margin
+    for para in (text or "").split("\n"):
+        para = para.replace("**", "").rstrip()
+        if not para:
+            y -= 6; continue
+        words = para.split(" ")
+        line = ""
+        for w in words:
+            test = (line + " " + w).strip()
+            if c.stringWidth(test, "Helvetica", 10.5) > max_w:
+                c.drawString(margin, y, line); y -= 14; line = w
+                if y < margin + 40:
+                    c.showPage(); y = H - margin; c.setFont("Helvetica", 10.5)
+            else:
+                line = test
+        if line:
+            c.drawString(margin, y, line); y -= 14
+            if y < margin + 40:
+                c.showPage(); y = H - margin; c.setFont("Helvetica", 10.5)
+
+    for img in images:
+        try:
+            ir = ImageReader(_io.BytesIO(img))
+            iw, ih = ir.getSize()
+            disp_w = max_w
+            disp_h = disp_w * ih / iw
+            if disp_h > H - 2 * margin:
+                disp_h = H - 2 * margin
+                disp_w = disp_h * iw / ih
+            if y - disp_h < margin:
+                c.showPage(); y = H - margin
+            c.drawImage(ir, margin, y - disp_h, width=disp_w, height=disp_h,
+                        preserveAspectRatio=True, mask="auto")
+            y -= disp_h + 18
+        except Exception:
+            pass
+
+    c.showPage(); c.save()
+    return buf.getvalue()
