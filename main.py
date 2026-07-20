@@ -920,6 +920,18 @@ def _research_style() -> str:
   .modebox { margin-top:0; }
   .modebox select { width:100%; border:0.5px solid #e2e6ea; border-radius:6px; padding:7px 8px;
                     font-size:12px; background:#fff; color:#2c3940; }
+  .notice { position:fixed; top:70px; left:50%; transform:translateX(-50%); z-index:60;
+            background:#fff; border:1px solid #9fe1cb; border-left:4px solid #1d9e73;
+            border-radius:10px; padding:16px 40px 16px 18px; box-shadow:0 8px 26px rgba(0,0,0,.16);
+            max-width:520px; width:90%; }
+  .notice .noticex { position:absolute; top:8px; right:10px; background:none; border:none;
+                     font-size:20px; color:#93a0a8; cursor:pointer; }
+  .notice .result .row { display:flex; gap:10px; margin-bottom:6px; font-size:13px; }
+  .notice .result .k { color:#5f6b72; min-width:110px; }
+  .notice .result .v { font-family:ui-monospace,Menlo,monospace; font-weight:600; color:#12456e; }
+  .notice .warn { font-size:12px; color:#5f6b72; margin:8px 0; }
+  .notice a { display:inline-block; background:#1d6fa5; color:#fff; text-decoration:none;
+              border-radius:7px; padding:8px 14px; font-size:13px; margin-top:4px; }
   .overlay { position:fixed; inset:0; background:rgba(20,30,40,.28); display:none;
              align-items:flex-start; justify-content:center; padding-top:40px; z-index:50; }
   .overlay.show { display:flex; }
@@ -1279,7 +1291,14 @@ const KEY = {_json.dumps(key)};
 const PROVNAME = {_json.dumps(name)};
 </script>
 """
-    return head + _RESEARCH_BODY
+    notice = ""
+    if banner:
+        notice = (
+            '<div class="notice" id="notice">'
+            '<button class="noticex" onclick="document.getElementById(\'notice\').remove()">&times;</button>'
+            + banner + '</div>'
+        )
+    return head + notice + _RESEARCH_BODY
 
 
 def _portal_dashboard(prov: dict, key: str, cur, banner: str = "") -> str:
