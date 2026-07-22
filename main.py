@@ -695,7 +695,9 @@ def _mailto(email: str, subject: str, body: str, text: str) -> str:
 
 
 def _mode_label(m: str) -> str:
-    return {"sleep": "Sleep", "rest": "Rest", "stand": "Stand", "breathwork": "Breathwork"}.get(m, m.capitalize())
+    return {"sleep": "Sleep", "rest": "Rest", "stand": "Stand", "breathwork": "Breathwork",
+            "circadian": "Circadian", "circadian_rhythm": "Circadian Rhythm",
+            "circadian_episodes": "Circadian Episodes"}.get(m, m.capitalize())
 
 
 # ---- Admin page ----------------------------------------------------------
@@ -1014,6 +1016,8 @@ _RESEARCH_BODY = r"""
           <option value="rest">Rest</option>
           <option value="stand">Stand</option>
           <option value="breathwork">Breathwork</option>
+          <option value="circadian">Circadian</option>
+          <option value="circadian_rhythm">Circadian Rhythm</option>
         </select>
       </div>
     </div>
@@ -1587,7 +1591,14 @@ class AgentChatRequest(BaseModel):
 # Rough budget for how much subject data to hand the agent as raw rows before
 # falling back to computed summaries. ~4 chars/token; keep well under context.
 DATA_CHAR_BUDGET = 220_000
-RESEARCH_MODES = ["sleep", "rest", "stand", "breathwork"]
+# Per-recording metric master modes: bundled into an Individual analysis and
+# offered for group comparison. One compact row per recording each.
+RESEARCH_MODES = ["sleep", "rest", "stand", "breathwork", "circadian", "circadian_rhythm", "circadian_episodes"]
+
+# Waveform strip data (raw PPG for sinus-control + episode strips). NOT a metric
+# master — it's long-format samples, pulled on demand when the researcher asks to
+# see rhythm strips, so it never bloats a routine analysis.
+STRIP_MODE = "circadian_strips"
 
 
 def _fetch_csv(cur, person_code: str, mode: str) -> Optional[str]:
@@ -1644,6 +1655,11 @@ def _build_data_context(cur, groups: dict[str, list[str]], mode: str) -> tuple[s
     if ind:
         for code in ind:
             pieces += subject_block(code, RESEARCH_MODES)
+            # Include rhythm strip waveform data (sinus control + any episodes)
+            # for the individual, so the agent can plot the strips on request.
+            strip = _fetch_csv(cur, code, STRIP_MODE)
+            if strip:
+                pieces.append((code, STRIP_MODE, strip))
     if (g1 or g2):
         cmp_modes = [mode] if mode in RESEARCH_MODES else []
         if cmp_modes:
@@ -1653,7 +1669,13 @@ def _build_data_context(cur, groups: dict[str, list[str]], mode: str) -> tuple[s
     if not pieces:
         return ("", False)
 
-    total_chars = sum(len(c) for _, _, c in pieces)
+    # Separate strip waveform data from metric data. Strips are never summarized
+    # (averaging a waveform is meaningless) and are excluded from the summary
+    # budget decision, so a big strip file can't force metrics into summary mode.
+    metric_pieces = [p for p in pieces if p[1] != STRIP_MODE]
+    strip_pieces = [p for p in pieces if p[1] == STRIP_MODE]
+
+    total_chars = sum(len(c) for _, _, c in metric_pieces)
     use_summary = total_chars > DATA_CHAR_BUDGET
 
     sections = []
@@ -1664,12 +1686,26 @@ def _build_data_context(cur, groups: dict[str, list[str]], mode: str) -> tuple[s
         if code in g2:  where.append("Group 2")
         return f"{code} [{', '.join(where)}]" if where else code
 
-    for code, md, csv_text in pieces:
+    for code, md, csv_text in metric_pieces:
         body = _summarize_csv(csv_text) if use_summary else csv_text.strip()
         kind = "summary" if use_summary else "raw CSV"
         sections.append(f"--- {label(code)} · {md} · {kind} ---\n{body}")
 
-    header = ("SUBJECT DATA (summaries — full raw data exceeded the size budget)"
+    # Strip waveform data: always raw (for plotting), capped so it can't blow context.
+    STRIP_CHAR_CAP = 400_000
+    for code, md, csv_text in strip_pieces:
+        body = csv_text.strip()
+        note = ""
+        if len(body) > STRIP_CHAR_CAP:
+            body = body[:STRIP_CHAR_CAP]
+            note = " (truncated)"
+        sections.append(
+            f"--- {label(code)} · rhythm strips (raw PPG waveform for plotting{note}) ---\n"
+            f"Columns: recording_ts, strip_type (sinus/episode), strip_id, rel_ms, ppg_green. "
+            f"Each strip_id is one ~30s strip; plot ppg_green vs rel_ms. 'sinus' is the clean "
+            f"control rhythm; 'episode' strips are flagged irregular-rhythm candidates.\n{body}")
+
+    header = ("SUBJECT DATA (metric summaries — full raw data exceeded the size budget)"
               if use_summary else "SUBJECT DATA (raw session rows)")
     return (header + "\n\n" + "\n\n".join(sections), use_summary)
 
