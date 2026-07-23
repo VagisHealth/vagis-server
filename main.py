@@ -221,6 +221,13 @@ def ensure_tables(cur) -> None:
     cur.execute(CREATE_PERSONS_SQL)
     cur.execute(CREATE_RESEARCH_UPLOADS_SQL)
     cur.execute(CREATE_CLINICAL_HOLDS_SQL)
+    # Cache of the Anthropic Files API id for each stored CSV, so the analysis
+    # agent reads data off disk in its sandbox instead of having it inlined in
+    # the prompt. Re-uploaded only when the underlying CSV is newer.
+    cur.execute("ALTER TABLE research_uploads "
+                "ADD COLUMN IF NOT EXISTS anthropic_file_id TEXT;")
+    cur.execute("ALTER TABLE research_uploads "
+                "ADD COLUMN IF NOT EXISTS file_uploaded_at TIMESTAMPTZ;")
 
 
 def purge_expired(cur) -> int:
@@ -1636,53 +1643,43 @@ def _summarize_csv(csv_text: str) -> str:
     return "\n".join(lines)
 
 
-def _build_data_context(cur, groups: dict[str, list[str]], mode: str) -> tuple[str, bool]:
-    """Assemble the data block for the agent. Individual -> all 4 modes raw.
-    Groups -> the chosen mode raw for each subject. Falls back to summaries if
-    the raw payload would exceed DATA_CHAR_BUDGET. Returns (text, used_summaries)."""
+def _mode_guide(md: str) -> str:
+    """One line telling the agent what a mode's columns mean."""
+    if md == "sleep_pwr_strips":
+        return ("Pulse Wave Rhythms strips. Columns: strip_id, rel_ms, pwa. strip_id is "
+                "<recording>#d1..#d5 for five consecutive 2-min disturbance strips (one "
+                "continuous 10-min segment) and <recording>#c for the 2-min control strip. "
+                "pwa is per-beat pulse wave amplitude (~1 Hz). Plot pwa vs rel_ms, one panel "
+                "per strip_id, disturbance strips in order with the control last; the "
+                "amplitude envelope is the signal (cyclic dips = disturbed, control flat).")
+    if md == "circadian_strips":
+        return ("Irregular-rhythm strips. Columns: recording_ts, strip_type (sinus/episode), "
+                "strip_id, rel_ms, ppg_green. Each strip_id is one ~30s strip; plot ppg_green "
+                "vs rel_ms. 'sinus' is the clean control rhythm; 'episode' strips are flagged "
+                "irregular-rhythm candidates.")
+    if md == "circadian_episodes":
+        return "Irregular-rhythm episode log: one row per detected episode (timing + duration)."
+    if md == "sleep_pwr":
+        return "Pulse Wave Rhythms selection log: one row per recording (segment times + scores)."
+    return f"{md} session metrics: one row per recording."
+
+
+def _selected_files(cur, groups: dict[str, list[str]], mode: str) -> list[dict[str, Any]]:
+    """Which stored CSVs this request needs. Individual -> all metric modes plus
+    its strip files; group comparison -> the chosen mode for each subject."""
     ind = groups.get("individual", []) or []
     g1 = groups.get("group1", []) or []
     g2 = groups.get("group2", []) or []
     mode = (mode or "").strip().lower()
 
-    # Gather raw pieces first, measure, then decide raw vs summary.
-    def subject_block(code: str, modes: list[str]) -> list[tuple[str, str, str]]:
-        out = []
-        for md in modes:
-            csv_text = _fetch_csv(cur, code, md)
-            if csv_text:
-                out.append((code, md, csv_text))
-        return out
+    wanted: list[tuple[str, str]] = []   # (person_code, mode)
+    for code in ind:
+        wanted += [(code, md) for md in RESEARCH_MODES]
+        wanted += [(code, sm) for sm in STRIP_MODES]
+    if g1 or g2:
+        if mode in RESEARCH_MODES:
+            wanted += [(code, mode) for code in g1 + g2]
 
-    pieces: list[tuple[str, str, str]] = []  # (code, mode, csv_text)
-    if ind:
-        for code in ind:
-            pieces += subject_block(code, RESEARCH_MODES)
-            # Include rhythm strip waveform data (sinus control + any episodes)
-            # for the individual, so the agent can plot the strips on request.
-            for _sm in STRIP_MODES:
-                strip = _fetch_csv(cur, code, _sm)
-                if strip:
-                    pieces.append((code, _sm, strip))
-    if (g1 or g2):
-        cmp_modes = [mode] if mode in RESEARCH_MODES else []
-        if cmp_modes:
-            for code in g1 + g2:
-                pieces += subject_block(code, cmp_modes)
-
-    if not pieces:
-        return ("", False)
-
-    # Separate strip waveform data from metric data. Strips are never summarized
-    # (averaging a waveform is meaningless) and are excluded from the summary
-    # budget decision, so a big strip file can't force metrics into summary mode.
-    metric_pieces = [p for p in pieces if p[1] not in STRIP_MODES]
-    strip_pieces = [p for p in pieces if p[1] in STRIP_MODES]
-
-    total_chars = sum(len(c) for _, _, c in metric_pieces)
-    use_summary = total_chars > DATA_CHAR_BUDGET
-
-    sections = []
     def label(code: str) -> str:
         where = []
         if code in ind: where.append("Individual")
@@ -1690,40 +1687,65 @@ def _build_data_context(cur, groups: dict[str, list[str]], mode: str) -> tuple[s
         if code in g2:  where.append("Group 2")
         return f"{code} [{', '.join(where)}]" if where else code
 
-    for code, md, csv_text in metric_pieces:
-        body = _summarize_csv(csv_text) if use_summary else csv_text.strip()
-        kind = "summary" if use_summary else "raw CSV"
-        sections.append(f"--- {label(code)} · {md} · {kind} ---\n{body}")
+    out = []
+    seen = set()
+    for code, md in wanted:
+        if (code, md) in seen:
+            continue
+        seen.add((code, md))
+        cur.execute("SELECT id, csv_text, row_count, uploaded_at, anthropic_file_id, "
+                    "file_uploaded_at FROM research_uploads WHERE person_code=%s AND mode=%s;",
+                    (code, md))
+        row = cur.fetchone()
+        if not row or not row[1]:
+            continue
+        out.append(dict(row_id=row[0], code=code, mode=md, csv_text=row[1],
+                        row_count=row[2], uploaded_at=row[3],
+                        file_id=row[4], file_uploaded_at=row[5],
+                        label=label(code),
+                        filename=f"{code}_{md}.csv"))
+    return out
 
-    # Strip waveform data: always raw (for plotting), capped so it can't blow context.
-    STRIP_CHAR_CAP = 400_000
-    for code, md, csv_text in strip_pieces:
-        body = csv_text.strip()
-        note = ""
-        if len(body) > STRIP_CHAR_CAP:
-            body = body[:STRIP_CHAR_CAP]
-            note = " (truncated)"
-        if md == "sleep_pwr_strips":
-            guide = ("Columns: strip_id, rel_ms, ppg_red. strip_id is <recording>#d1..#d5 for the "
-                     "five consecutive 2-min disturbance strips (one continuous 10-min segment) and "
-                     "<recording>#c for the 2-min control strip. Plot ppg_red vs rel_ms, one panel "
-                     "per strip_id, and high-pass filter to remove baseline wander unless asked "
-                     "otherwise.")
-            title = "Pulse Wave Rhythms strips (raw red PPG waveform for plotting"
-        else:
-            guide = ("Columns: recording_ts, strip_type (sinus/episode), strip_id, rel_ms, ppg_green. "
-                     "Each strip_id is one ~30s strip; plot ppg_green vs rel_ms. 'sinus' is the clean "
-                     "control rhythm; 'episode' strips are flagged irregular-rhythm candidates.")
-            title = "rhythm strips (raw PPG waveform for plotting"
-        sections.append(f"--- {label(code)} · {title}{note}) ---\n{guide}\n{body}")
 
-    header = ("SUBJECT DATA (metric summaries — full raw data exceeded the size budget)"
-              if use_summary else "SUBJECT DATA (raw session rows)")
-    return (header + "\n\n" + "\n\n".join(sections), use_summary)
+def _ensure_files_uploaded(cur, files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Push each CSV to the Anthropic Files API once and cache its id, so the
+    agent's sandbox reads it from disk rather than having it inlined in the
+    prompt. Re-uploads only when the stored CSV is newer than the cached file."""
+    import io as _io
+    ready = []
+    for f in files:
+        fid = f.get("file_id")
+        stale = (f.get("file_uploaded_at") is None or f.get("uploaded_at") is None
+                 or f["file_uploaded_at"] < f["uploaded_at"])
+        if not fid or stale:
+            try:
+                up = client.beta.files.upload(
+                    file=(f["filename"], _io.BytesIO(f["csv_text"].encode("utf-8")), "text/csv"))
+                fid = getattr(up, "id", None)
+                if fid:
+                    cur.execute("UPDATE research_uploads SET anthropic_file_id=%s, "
+                                "file_uploaded_at=now() WHERE id=%s;", (fid, f["row_id"]))
+            except Exception:
+                fid = None
+        if fid:
+            f["file_id"] = fid
+            ready.append(f)
+    return ready
+
+
+def _files_manifest(files: list[dict[str, Any]]) -> str:
+    """Human-readable listing of what's mounted in the sandbox."""
+    if not files:
+        return ""
+    lines = []
+    for f in files:
+        rc = f"{f['row_count']} rows" if f.get("row_count") else "unknown size"
+        lines.append(f"- {f['filename']}  ({f['label']} · {rc})\n    {_mode_guide(f['mode'])}")
+    return "\n".join(lines)
 
 
 def _research_agent_system(groups: dict[str, list[str]], mode: str,
-                           data_block: str, used_summary: bool) -> str:
+                           manifest: str) -> str:
     ind = groups.get("individual", []) or []
     g1 = groups.get("group1", []) or []
     g2 = groups.get("group2", []) or []
@@ -1743,53 +1765,39 @@ def _research_agent_system(groups: dict[str, list[str]], mode: str,
         "The researcher is responsible for which subject codes belong to which group.\n\n"
     )
 
-    if data_block:
-        cap = (
-            "The selected subjects' data is provided below. For an Individual, all four "
-            "recording modes are included; for a group comparison, the chosen mode is "
-            "included for every subject.\n\n"
-            "YOU HAVE A PYTHON CODE-EXECUTION TOOL. When the researcher asks for a "
-            "statistical test, comparison, or figure, USE IT to compute real results on the "
-            "data above (pandas, numpy, scipy, statsmodels, matplotlib, seaborn are "
-            "available). Run exactly the analysis the researcher prescribes — they own the "
-            "statistical choice; execute it faithfully rather than substituting your own.\n\n"
-            "SPEED IS CRITICAL — WORK IN ONE PASS:\n"
-            "- Do the ENTIRE analysis in a SINGLE code execution: parse the data, do any "
-            "splitting/grouping, run the test, and generate the figure(s) all in one script. "
-            "Do NOT run code to 'first look at' or 'examine' the data and then run more code — "
-            "that wastes minutes. One script that does everything, then report.\n"
-            "- Do NOT narrate what you are about to do (no 'let me first examine...', no 'now "
-            "I'll run the stats'). Just run the one script, then give the results.\n"
-            "- Make ONE focused figure unless the researcher explicitly asks for more. Keep it "
-            "simple and fast to render.\n"
-            "- If any assumption is needed (e.g. how to split), make the reasonable choice "
-            "inside the single script and state it in your summary — don't stop to ask.\n\n"
-            "HOW TO REPORT:\n"
-            "- The researcher is a scientist who wants RESULTS, not code. NEVER show, print, "
-            "or describe the code you ran. Give only a clear, plain-language summary.\n"
-            "- Report the real computed numbers: test used, n per group, group means ± SD, "
-            "the statistic, p-value, and an effect size where appropriate.\n"
-            "- Save each figure as a PNG. Put the KEY STATISTICS ON THE FIGURE ITSELF where "
-            "sensible (p-value, group means, error bars, n per group), with clear axis labels "
-            "and a short title, so it is publication-usable and self-contained.\n"
-            "- Do NOT fabricate. Only report what the computation produced. If the data can't "
-            "support the requested test, say so plainly rather than forcing a result.\n"
-        )
-        if used_summary:
-            cap += ("\nNote: the data was large, so per-column SUMMARIES (n, mean, sd, min, "
-                    "max) are provided instead of raw rows. You can reason over these but "
-                    "cannot run per-session tests on summarized data — say so if a test needs "
-                    "raw rows.\n")
-        return base + cap + "\n" + data_block
-    else:
+    if manifest:
         return base + (
-            "No subject data is loaded for this request (nothing selected, or the selected "
-            "subjects have no uploaded data for the chosen mode). You can discuss study design "
-            "and which tests would fit — but do NOT run code or fabricate numbers."
+            "YOU HAVE A PYTHON CODE-EXECUTION TOOL, and the selected subjects' CSV files are "
+            "already mounted in your sandbox working directory. READ THEM FROM DISK with "
+            "pandas (e.g. pd.read_csv('FILENAME.csv')) — never retype the data into your "
+            "script, and never ask for it to be pasted.\n\n"
+            "Files available:\n" + manifest + "\n\n"
+            "SPEED IS CRITICAL — WORK IN ONE PASS:\n"
+            "- Do the ENTIRE analysis in a SINGLE code execution: load the file(s), compute, "
+            "and generate the figure(s) in one script. Do not run exploratory code first.\n"
+            "- Do NOT narrate what you are about to do. Run the script, then report.\n"
+            "- Make ONE focused figure unless the researcher asks for more.\n"
+            "- Make reasonable assumptions inside the script and state them in your summary "
+            "rather than stopping to ask.\n\n"
+            "HOW TO REPORT:\n"
+            "- The researcher wants RESULTS, not code. NEVER show, print, or describe the code "
+            "you ran. Give only a clear, plain-language summary.\n"
+            "- Report the real computed numbers: test used, n per group, means \u00b1 SD, the "
+            "statistic, p-value, and an effect size where appropriate.\n"
+            "- Save each figure as a PNG. Put KEY STATISTICS ON THE FIGURE where sensible "
+            "(p-value, group means, error bars, n), with clear axis labels and a short title.\n"
+            "- Do NOT fabricate. Only report what the computation produced. If the data can't "
+            "support the requested test, say so plainly.\n"
         )
+    return base + (
+        "No subject data is loaded for this request (nothing selected, or the selected "
+        "subjects have no uploaded data for the chosen mode). You can discuss study design "
+        "and which tests would fit — but do NOT run code or fabricate numbers."
+    )
 
 
 CODE_EXEC_TOOL = {"type": "code_execution_20250825", "name": "code_execution"}
+AGENT_BETAS = ["code-execution-2025-08-25", "files-api-2025-04-14"]
 AGENT_MAX_TOKENS = int(os.environ.get("VAGIS_AGENT_MAX_TOKENS", "16000"))
 
 
@@ -1831,11 +1839,13 @@ def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
             if not prov or prov["kind"] != "research":
                 raise HTTPException(status_code=401, detail="Not authorized for the research agent.")
             owned = _owned_selection(cur, prov["provider_code"], req.groups)
-            data_block, used_summary = _build_data_context(cur, owned, req.mode)
+            wanted = _selected_files(cur, owned, req.mode)
+            files = _ensure_files_uploaded(cur, wanted)
     finally:
         conn.close()
 
-    system = _research_agent_system(owned, req.mode, data_block, used_summary)
+    manifest = _files_manifest(files)
+    system = _research_agent_system(owned, req.mode, manifest)
 
     messages = []
     for turn in req.history[-20:]:
@@ -1845,6 +1855,25 @@ def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
             messages.append({"role": role, "content": content})
     if not messages:
         messages = [{"role": "user", "content": req.message}]
+
+    # Mount the CSVs in the sandbox by attaching them to the latest user turn.
+    # The agent reads them from disk instead of the data being inlined here.
+    if files:
+        blocks: list[dict[str, Any]] = []
+        last = messages[-1]
+        if last.get("role") == "user":
+            text = last.get("content")
+            if isinstance(text, str):
+                blocks.append({"type": "text", "text": text})
+            elif isinstance(text, list):
+                blocks.extend(text)
+        else:
+            blocks.append({"type": "text", "text": req.message})
+            messages.append({"role": "user", "content": blocks})
+            last = messages[-1]
+        for f in files:
+            blocks.append({"type": "container_upload", "file_id": f["file_id"]})
+        last["content"] = blocks
 
     figure_ids: list[str] = []
     container_id = None
@@ -1859,10 +1888,11 @@ def research_agent_chat(req: AgentChatRequest) -> dict[str, Any]:
     try:
         for _i in range(10):  # safety bound on continuations
             kwargs = dict(model=MODEL, max_tokens=AGENT_MAX_TOKENS,
-                          system=system, messages=messages, tools=[CODE_EXEC_TOOL])
+                          system=system, messages=messages, tools=[CODE_EXEC_TOOL],
+                          betas=AGENT_BETAS)
             if container_id:
                 kwargs["container"] = container_id
-            m = client.with_options(timeout=170.0).messages.create(**kwargs)
+            m = client.with_options(timeout=170.0).beta.messages.create(**kwargs)
 
             if getattr(m, "container", None):
                 container_id = m.container.id
