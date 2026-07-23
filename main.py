@@ -697,7 +697,8 @@ def _mailto(email: str, subject: str, body: str, text: str) -> str:
 def _mode_label(m: str) -> str:
     return {"sleep": "Sleep", "rest": "Rest", "stand": "Stand", "breathwork": "Breathwork",
             "circadian": "Circadian", "circadian_rhythm": "Circadian Rhythm",
-            "circadian_episodes": "Circadian Episodes"}.get(m, m.capitalize())
+            "circadian_episodes": "Circadian Episodes",
+            "sleep_pwr": "Pulse Wave Rhythms"}.get(m, m.capitalize())
 
 
 # ---- Admin page ----------------------------------------------------------
@@ -1018,6 +1019,7 @@ _RESEARCH_BODY = r"""
           <option value="breathwork">Breathwork</option>
           <option value="circadian">Circadian</option>
           <option value="circadian_rhythm">Circadian Rhythm</option>
+          <option value="sleep_pwr">Pulse Wave Rhythms</option>
         </select>
       </div>
     </div>
@@ -1593,12 +1595,13 @@ class AgentChatRequest(BaseModel):
 DATA_CHAR_BUDGET = 220_000
 # Per-recording metric master modes: bundled into an Individual analysis and
 # offered for group comparison. One compact row per recording each.
-RESEARCH_MODES = ["sleep", "rest", "stand", "breathwork", "circadian", "circadian_rhythm", "circadian_episodes"]
+RESEARCH_MODES = ["sleep", "rest", "stand", "breathwork", "circadian", "circadian_rhythm",
+                  "circadian_episodes", "sleep_pwr"]
 
 # Waveform strip data (raw PPG for sinus-control + episode strips). NOT a metric
 # master — it's long-format samples, pulled on demand when the researcher asks to
 # see rhythm strips, so it never bloats a routine analysis.
-STRIP_MODE = "circadian_strips"
+STRIP_MODES = ["circadian_strips", "sleep_pwr_strips"]
 
 
 def _fetch_csv(cur, person_code: str, mode: str) -> Optional[str]:
@@ -1657,9 +1660,10 @@ def _build_data_context(cur, groups: dict[str, list[str]], mode: str) -> tuple[s
             pieces += subject_block(code, RESEARCH_MODES)
             # Include rhythm strip waveform data (sinus control + any episodes)
             # for the individual, so the agent can plot the strips on request.
-            strip = _fetch_csv(cur, code, STRIP_MODE)
-            if strip:
-                pieces.append((code, STRIP_MODE, strip))
+            for _sm in STRIP_MODES:
+                strip = _fetch_csv(cur, code, _sm)
+                if strip:
+                    pieces.append((code, _sm, strip))
     if (g1 or g2):
         cmp_modes = [mode] if mode in RESEARCH_MODES else []
         if cmp_modes:
@@ -1672,8 +1676,8 @@ def _build_data_context(cur, groups: dict[str, list[str]], mode: str) -> tuple[s
     # Separate strip waveform data from metric data. Strips are never summarized
     # (averaging a waveform is meaningless) and are excluded from the summary
     # budget decision, so a big strip file can't force metrics into summary mode.
-    metric_pieces = [p for p in pieces if p[1] != STRIP_MODE]
-    strip_pieces = [p for p in pieces if p[1] == STRIP_MODE]
+    metric_pieces = [p for p in pieces if p[1] not in STRIP_MODES]
+    strip_pieces = [p for p in pieces if p[1] in STRIP_MODES]
 
     total_chars = sum(len(c) for _, _, c in metric_pieces)
     use_summary = total_chars > DATA_CHAR_BUDGET
@@ -1699,11 +1703,19 @@ def _build_data_context(cur, groups: dict[str, list[str]], mode: str) -> tuple[s
         if len(body) > STRIP_CHAR_CAP:
             body = body[:STRIP_CHAR_CAP]
             note = " (truncated)"
-        sections.append(
-            f"--- {label(code)} · rhythm strips (raw PPG waveform for plotting{note}) ---\n"
-            f"Columns: recording_ts, strip_type (sinus/episode), strip_id, rel_ms, ppg_green. "
-            f"Each strip_id is one ~30s strip; plot ppg_green vs rel_ms. 'sinus' is the clean "
-            f"control rhythm; 'episode' strips are flagged irregular-rhythm candidates.\n{body}")
+        if md == "sleep_pwr_strips":
+            guide = ("Columns: strip_id, rel_ms, ppg_red. strip_id is <recording>#d1..#d5 for the "
+                     "five consecutive 2-min disturbance strips (one continuous 10-min segment) and "
+                     "<recording>#c for the 2-min control strip. Plot ppg_red vs rel_ms, one panel "
+                     "per strip_id, and high-pass filter to remove baseline wander unless asked "
+                     "otherwise.")
+            title = "Pulse Wave Rhythms strips (raw red PPG waveform for plotting"
+        else:
+            guide = ("Columns: recording_ts, strip_type (sinus/episode), strip_id, rel_ms, ppg_green. "
+                     "Each strip_id is one ~30s strip; plot ppg_green vs rel_ms. 'sinus' is the clean "
+                     "control rhythm; 'episode' strips are flagged irregular-rhythm candidates.")
+            title = "rhythm strips (raw PPG waveform for plotting"
+        sections.append(f"--- {label(code)} · {title}{note}) ---\n{guide}\n{body}")
 
     header = ("SUBJECT DATA (metric summaries — full raw data exceeded the size budget)"
               if use_summary else "SUBJECT DATA (raw session rows)")
