@@ -1647,11 +1647,22 @@ def _mode_guide(md: str) -> str:
     """One line telling the agent what a mode's columns mean."""
     if md == "sleep_pwr_strips":
         return ("Pulse Wave Rhythms strips. Columns: strip_id, rel_ms, pwa. strip_id is "
-                "<recording>#d1..#d5 for five consecutive 2-min disturbance strips (one "
-                "continuous 10-min segment) and <recording>#c for the 2-min control strip. "
-                "pwa is per-beat pulse wave amplitude (~1 Hz). Plot pwa vs rel_ms, one panel "
-                "per strip_id, disturbance strips in order with the control last; the "
-                "amplitude envelope is the signal (cyclic dips = disturbed, control flat).")
+                "<recording>#d1..#d5 for the disturbance segment and <recording>#c1..#c5 "
+                "for the control segment. Within each segment the five strips are "
+                "consecutive 2-min windows forming one continuous 10-min segment, so "
+                "concatenate them in strip order (rel_ms restarts at 0 in each strip: add "
+                "120000 ms per preceding strip) and plot each segment as ONE continuous "
+                "trace, not five panels. Recordings made before the control was widened "
+                "have a single 2-min <recording>#c instead of #c1..#c5 — handle both. "
+                "pwa is per-beat pulse wave amplitude (~1 Hz). Before plotting, drop "
+                "artifact beats above median + 8*MAD (motion spikes reach ~600k against a "
+                "~10k baseline and otherwise destroy the y-axis) and say how many were "
+                "dropped. Give both segments the same y-scale, and the same seconds-per-inch "
+                "on x, so a shorter control is not stretched to match. For clock time, join "
+                "to the sleep_pwr selection log on the recording timestamp in strip_id and "
+                "use disturbance_start / control_start as each segment's start; do not "
+                "infer the time from strip_id alone. The amplitude envelope is the signal "
+                "(cyclic dips in the disturbance segment, flatter control).")
     if md == "circadian_strips":
         return ("Irregular-rhythm strips. Columns: recording_ts, strip_type (sinus/episode), "
                 "strip_id, rel_ms, ppg_green. Each strip_id is one ~30s strip; plot ppg_green "
