@@ -1083,12 +1083,12 @@ _RESEARCH_BODY = r"""
           </div>
 
           <div class="pf">
-            <label for="pStart">Recording from</label>
+            <label for="pStart">Date start</label>
             <input type="date" id="pStart" title="Date the recording was made">
           </div>
 
           <div class="pf">
-            <label for="pEnd">Recording to</label>
+            <label for="pEnd">Date end</label>
             <input type="date" id="pEnd" title="Date the recording was made">
           </div>
 
