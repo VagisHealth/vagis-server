@@ -877,7 +877,7 @@ def _research_style() -> str:
   * { box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
          margin: 0; background: #f4f6f8; color: #1a2b34; }
-  .wrap { max-width: 1180px; margin: 0 auto; padding: 16px; height: 100vh; display:flex; flex-direction:column; }
+  .wrap { max-width: 1500px; margin: 0 auto; padding: 16px; height: 100vh; display:flex; flex-direction:column; }
   .topbar { display:flex; align-items:center; justify-content:space-between;
             background:#fff; border:0.5px solid #e2e6ea; border-radius:10px; padding:11px 16px; margin-bottom:12px; }
   .brand { display:flex; align-items:center; gap:9px; font-size:16px; font-weight:600; }
@@ -888,7 +888,7 @@ def _research_style() -> str:
   .banner { background:#e1f5ee;border:1px solid #9fe1cb;border-radius:9px;padding:12px 14px;margin-bottom:12px;
             font-size:14px;color:#085041; }
   .banner .v { font-family:ui-monospace,Menlo,monospace;font-weight:600; }
-  .grid { display:grid; grid-template-columns:130px 160px 1fr; gap:10px; align-items:stretch;
+  .grid { display:grid; grid-template-columns:170px 170px 1fr; gap:10px; align-items:stretch;
           flex:1; min-height:0; }
   .card { background:#fff; border:0.5px solid #e2e6ea; border-radius:10px; padding:11px; }
   .lbl { font-size:10px;font-weight:600;color:#5f6b72;text-transform:uppercase;letter-spacing:.3px;margin-bottom:8px; }
@@ -904,7 +904,8 @@ def _research_style() -> str:
   .box.grow { flex:1; display:flex; flex-direction:column; margin-bottom:9px; min-height:0; }
   .box.grow:last-child { margin-bottom:0; }
   .box .hd { display:flex;align-items:center;justify-content:space-between;margin-bottom:6px; }
-  .box .hd .name { font-size:11px;font-weight:600; }
+  .box .hd .name { font-size:10px; font-weight:600; color:#5f6b72;
+                   text-transform:uppercase; letter-spacing:.3px; }
   .box .hd .btns { display:flex;gap:4px; }
   .minibtn { font-size:10px; border:0.5px solid #ccd4da; background:#fff; border-radius:5px;
              padding:2px 6px; cursor:pointer; color:#3a4750; }
@@ -949,9 +950,30 @@ def _research_style() -> str:
   .issue input { border:0.5px solid #e2e6ea; border-radius:6px; padding:6px 8px; font-size:12px; }
   .issue button { background:#1d6fa5;color:#fff;border:none;border-radius:6px;padding:7px 11px;font-size:12px;cursor:pointer; }
   .hint { font-size:10px;color:#93a0a8;margin-top:6px;text-align:center; }
-  .modebox { margin-top:0; }
-  .modebox select { width:100%; border:0.5px solid #e2e6ea; border-radius:6px; padding:7px 8px;
-                    font-size:12px; background:#fff; color:#2c3940; }
+  /* ---- analysis preset bar ---- */
+  .presets { border-bottom:0.5px solid #e2e6ea; padding-bottom:9px; margin-bottom:9px; }
+  .presetrow { display:flex; align-items:flex-end; gap:8px; }
+  .presetrow .pf { flex:1 1 0; }
+  .presetrow .pacts { display:flex; gap:6px; flex:0 0 auto; }
+  .pf { display:flex; flex-direction:column; gap:4px; min-width:0; }
+  .pf label { font-size:10px; font-weight:600; color:#5f6b72;
+              text-transform:uppercase; letter-spacing:.3px; }
+  .pf select, .pf input[type=date] {
+    width:100%; border:0.5px solid #e2e6ea; border-radius:6px; padding:7px 8px;
+    font-size:12px; font-family:inherit; background:#fff; color:#2c3940; }
+  .pf select:disabled, .pf input[type=date]:disabled { background:#f6f7f8; color:#b7c0c7; }
+  .alltog { flex:0 0 auto; }
+  .alltog button { border:0.5px solid #ccd4da; background:#fff; color:#3a4750;
+                   border-radius:6px; padding:7px 9px; font-size:12px; font-family:inherit;
+                   cursor:pointer; height:31px; white-space:nowrap; }
+  .alltog button.on { background:#eef6fc; border-color:#9fbdd8; color:#12456e; font-weight:600; }
+  .pbtn { background:#1d6fa5; color:#fff; border:none; border-radius:6px;
+          padding:7px 11px; font-size:12px; cursor:pointer; height:31px; }
+  .pbtn.ghost { background:#fff; border:0.5px solid #ccd4da; color:#3a4750; }
+  .periodrow { display:none; align-items:flex-end; gap:8px; margin-top:8px; }
+  .periodrow.on { display:flex; }
+  .periodrow .ptag { flex:0 0 auto; font-size:10px; font-weight:600; color:#5f6b72;
+                     text-transform:uppercase; letter-spacing:.3px; padding-bottom:8px; }
   .notice { position:fixed; top:70px; left:50%; transform:translateX(-50%); z-index:60;
             background:#fff; border:1px solid #9fe1cb; border-left:4px solid #1d9e73;
             border-radius:10px; padding:16px 40px 16px 18px; box-shadow:0 8px 26px rgba(0,0,0,.16);
@@ -1028,32 +1050,114 @@ _RESEARCH_BODY = r"""
         <div class="drop drop-sm" data-box="individual" tabindex="0"></div>
       </div>
       <div class="card box g1 grow">
-        <div class="hd"><span class="name" style="color:#185fa5">Group 1</span>
+        <div class="hd"><span class="name">Group 1</span>
           <span class="btns"><button class="minibtn" onclick="addSel('group1')">&rarr;</button>
           <button class="minibtn" onclick="clearBox('group1')">clear</button></span></div>
         <div class="groupbody" id="group1" data-box="group1" tabindex="0"></div>
       </div>
       <div class="card box g2 grow">
-        <div class="hd"><span class="name" style="color:#3b6d11">Group 2</span>
+        <div class="hd"><span class="name">Group 2</span>
           <span class="btns"><button class="minibtn" onclick="addSel('group2')">&rarr;</button>
           <button class="minibtn" onclick="clearBox('group2')">clear</button></span></div>
         <div class="groupbody" id="group2" data-box="group2" tabindex="0"></div>
       </div>
-      <div class="card modebox">
-        <div class="lbl">Group comparison mode</div>
-        <select id="modeSelect">
-          <option value="sleep">Sleep</option>
-          <option value="rest">Rest</option>
-          <option value="stand">Stand</option>
-          <option value="breathwork">Breathwork</option>
-          <option value="circadian">Circadian</option>
-          <option value="circadian_rhythm">Circadian Rhythm</option>
-          <option value="sleep_pwr">Pulse Wave Rhythms</option>
-        </select>
-      </div>
     </div>
 
     <div class="card agent">
+
+      <!-- ===== analysis preset bar ===== -->
+      <div class="presets">
+        <div class="presetrow">
+
+          <div class="pf">
+            <label for="pScope">Scope</label>
+            <select id="pScope">
+              <option value="">&mdash;</option>
+              <option value="individual">Individual</option>
+              <option value="indcmp">Individual &mdash; compare periods</option>
+              <option value="group1">Group 1</option>
+              <option value="g1cmp">Group 1 &mdash; compare periods</option>
+              <option value="group2">Group 2</option>
+              <option value="groupcmp">Group 1 vs Group 2</option>
+            </select>
+          </div>
+
+          <div class="pf">
+            <label for="pStart">Recording from</label>
+            <input type="date" id="pStart" title="Date the recording was made">
+          </div>
+
+          <div class="pf">
+            <label for="pEnd">Recording to</label>
+            <input type="date" id="pEnd" title="Date the recording was made">
+          </div>
+
+          <div class="pf alltog">
+            <label for="pAll">&nbsp;</label>
+            <button type="button" id="pAll" onclick="toggleAllDates()">All dates</button>
+          </div>
+
+          <div class="pf">
+            <label for="pMode">Mode</label>
+            <select id="pMode">
+              <option value="">&mdash;</option>
+              <optgroup label="Sleep">
+                <option value="sleep">Sleep metrics</option>
+                <option value="sleep_pwr">Pulse Wave Rhythms metrics</option>
+                <option value="sleep_pwr_episodes">Pulse Wave Rhythms episodes</option>
+                <option value="sleep_pwr_strips">Pulse Wave Rhythms strip</option>
+              </optgroup>
+              <optgroup label="Rest">
+                <option value="rest">Rest metrics</option>
+              </optgroup>
+              <optgroup label="Stand">
+                <option value="stand">Stand metrics</option>
+              </optgroup>
+              <optgroup label="Breathwork">
+                <option value="breathwork">Breathwork metrics</option>
+              </optgroup>
+              <optgroup label="Circadian">
+                <option value="circadian">Circadian metrics</option>
+                <option value="circadian_rhythm">Irregular rhythm metrics</option>
+                <option value="circadian_episodes">Episodes</option>
+                <option value="circadian_strips">Strips</option>
+              </optgroup>
+            </select>
+          </div>
+
+          <div class="pf">
+            <label for="pMetric">Metric</label>
+            <select id="pMetric"><option value="">&mdash;</option></select>
+          </div>
+
+          <div class="pf">
+            <label for="pAnalysis">Analysis</label>
+            <select id="pAnalysis"><option value="">&mdash;</option></select>
+          </div>
+
+          <div class="pacts">
+            <button type="button" class="pbtn ghost" onclick="clearPreset()">Clear</button>
+            <button type="button" class="pbtn" onclick="buildPrompt()">Build prompt</button>
+          </div>
+
+        </div>
+
+        <div class="periodrow" id="periodRow">
+          <span class="ptag">Period A</span>
+          <div class="pf"><label for="pA1">From</label>
+            <input type="date" id="pA1" title="Date the recording was made"></div>
+          <div class="pf"><label for="pA2">To</label>
+            <input type="date" id="pA2" title="Date the recording was made"></div>
+          <span class="ptag">Period B</span>
+          <div class="pf"><label for="pB1">From</label>
+            <input type="date" id="pB1" title="Date the recording was made"></div>
+          <div class="pf"><label for="pB2">To</label>
+            <input type="date" id="pB2" title="Date the recording was made"></div>
+        </div>
+
+      </div>
+      <!-- ===== end preset bar ===== -->
+
       <div class="lbl">Analysis agent</div>
       <div class="msgs" id="msgs"></div>
       <div class="composer">
@@ -1275,7 +1379,7 @@ async function send() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ provider_code: PROVIDER, key: KEY, message: msg,
                              history: conversation, groups: groupsPayload(),
-                             mode: document.getElementById('modeSelect').value })
+                             mode: document.getElementById('pMode').value })
     });
     const data = await res.json();
     clearInterval(ticker); thinking.remove();
@@ -1296,6 +1400,120 @@ async function send() {
 document.getElementById('input').addEventListener('keydown', function(e) {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 });
+
+/* ===================== analysis preset bar ===================== */
+
+/* Metric options per mode, from each master CSV's columns. Timestamp and
+   identifier columns are omitted — they drive the date filter, they are not
+   things to analyse. */
+const METRICS = {
+  sleep: ["duration_min","deep_min","rem_min","nrem_min","awake_min","total_sleep_min",
+          "mean_hr","resp_rate_brpm","adi_score","rem_vlf_pct","deep_vlf_pct",
+          "night_mean_vlf_pct","position_per_hour","pwad_score","PPI_PWA_Coup"],
+  rest: ["duration_min","mean_hr","avg_ibi_ms","resp_rate_brpm","avg_pwa","coherence",
+         "phase_deg","breath_rate_cpm","hrdb_bpm","ei_ratio","band1_endothelial",
+         "band2_neurogenic","band3_myogenic","band4_respiratory"],
+  stand: ["duration_s","motion_valid","cue_time_s","stand_onset_s","beats_supine",
+          "beats_stand","beats_t3_supine","beats_t3_stand","supine_hr","supine_pwa",
+          "supine_dc","supine_ttp_ms","supine_ttp_frac","supine_rise_steep",
+          "supine_resp_brpm","supine_resp_conf","stand_hr","stand_peak_hr","stand_pwa",
+          "stand_dc","stand_ttp_ms","stand_ttp_frac","stand_rise_steep","delta_hr",
+          "delta_pwa_pct","delta_dc_pct","delta_ttp_frac","beats_return","return_hr",
+          "return_pwa","return_dc","return_ttp_ms","return_ttp_frac","return_sdnn",
+          "delta_return_hr","delta_return_pwa_pct","delta_return_dc_pct",
+          "delta_return_ttp_frac","ratio_3015","ratio_3015_min_ppi","ratio_3015_max_ppi",
+          "pots_rise_1min","pots_rise_2min","pots_met","hr_time_to_peak_s",
+          "hr_rise_rate_bpm_s","hr_onset_latency_s","hr_peak_to_plateau",
+          "pwa_onset_latency_s","pwa_settle_time_s","dc_onset_latency_s",
+          "dc_settle_time_s","venoarteriolar_ratio"],
+  breathwork: ["duration_min","mean_hr","ln_lf","rsa","coherence","phase_deg",
+               "breath_rate_cpm","hrdb_bpm","ei_ratio","pwv_sd"],
+  circadian: ["coupling_slope","coupling_intercept","coupling_r","cardiac_cost",
+              "still_pct","light_pct","mod_pct","hr_still","hr_light","hr_mod",
+              "hr_mean","hr_min","hr_max","hr_range",
+              "recovery_tau_sec","recovery_hr_drop","recovery_confidence"],
+  circadian_rhythm: [], circadian_episodes: [],
+  circadian_strips: ["ppg_green"],
+  sleep_pwr: ["n_episodes","episode_min_total","drops_total","strip_mean_depth"],
+  sleep_pwr_episodes: [],
+  sleep_pwr_strips: ["pwa","accel"]
+};
+
+/* Log-style files: the agent renders the whole file as a table, so there is no
+   single metric to pick. */
+const TABLE_MODES = ["sleep_pwr_episodes", "circadian_rhythm", "circadian_episodes"];
+
+const pModeEl = document.getElementById('pMode');
+const pMetricEl = document.getElementById('pMetric');
+const pScopeEl = document.getElementById('pScope');
+let allDates = true;
+
+function fillMetrics() {
+  if (TABLE_MODES.indexOf(pModeEl.value) !== -1) {
+    pMetricEl.innerHTML = '<option value="all">All columns (table)</option>';
+    pMetricEl.disabled = true;
+    return;
+  }
+  const list = METRICS[pModeEl.value] || [];
+  pMetricEl.innerHTML = '<option value="">\u2014</option>';
+  list.forEach(function(m) {
+    const o = document.createElement('option');
+    o.value = m; o.textContent = m;
+    pMetricEl.appendChild(o);
+  });
+  pMetricEl.disabled = list.length === 0;
+}
+pModeEl.addEventListener('change', fillMetrics);
+
+function applyAllDates() {
+  const st = document.getElementById('pStart');
+  const en = document.getElementById('pEnd');
+  document.getElementById('pAll').classList.toggle('on', allDates);
+  st.disabled = allDates; en.disabled = allDates;
+  if (allDates) { st.value = ''; en.value = ''; }
+}
+function toggleAllDates() { allDates = !allDates; applyAllDates(); }
+['pStart','pEnd'].forEach(function(id) {
+  document.getElementById(id).addEventListener('input', function() {
+    if (allDates) { allDates = false; applyAllDates(); }
+  });
+});
+
+/* Compare-periods scopes swap the single window for Period A / Period B. */
+function applyScope() {
+  const cmp = (pScopeEl.value === 'indcmp' || pScopeEl.value === 'g1cmp');
+  document.getElementById('periodRow').classList.toggle('on', cmp);
+  ['pStart','pEnd'].forEach(function(id) {
+    document.getElementById(id).closest('.pf').style.display = cmp ? 'none' : '';
+  });
+  document.querySelector('.alltog').style.display = cmp ? 'none' : '';
+}
+pScopeEl.addEventListener('change', applyScope);
+
+function clearPreset() {
+  pScopeEl.value = '';
+  allDates = true; applyAllDates();
+  document.getElementById('pStart').value = '';
+  document.getElementById('pEnd').value = '';
+  ['pA1','pA2','pB1','pB2'].forEach(function(id) {
+    document.getElementById(id).value = '';
+  });
+  pModeEl.value = ''; fillMetrics();
+  document.getElementById('pAnalysis').value = '';
+  applyScope();
+  document.getElementById('input').value = '';
+}
+
+/* The Analysis dropdown is not populated yet — the preset prompt text is the
+   next piece of work. Build prompt fills the composer, editable before sending. */
+function buildPrompt() {
+  document.getElementById('input').value = '[preset prompt text not written yet]';
+  document.getElementById('input').focus();
+}
+
+fillMetrics();
+applyAllDates();
+applyScope();
 
 renderAll();
 </script>
@@ -1668,9 +1886,11 @@ def _summarize_csv(csv_text: str) -> str:
 def _mode_guide(md: str) -> str:
     """One line telling the agent what a mode's columns mean."""
     if md == "sleep_pwr_strips":
-        return ("Pulse Wave Rhythms strip. Columns: strip_id, rel_ms, pwa, accel, tier. "
-                "strip_id is <recording_ts>#strip — ONE continuous 10-minute segment per "
-                "recording, so no concatenation is needed. rel_ms runs 0 to 600000. pwa is "
+        return ("Pulse Wave Rhythms strip. Columns: recording_ts, strip_id, rel_ms, pwa, "
+                "accel, tier. strip_id is <recording_ts>#strip — ONE continuous 10-minute "
+                "segment per recording, so no concatenation is needed. Join to the "
+                "sleep_pwr and sleep_pwr_episodes files on recording_ts. rel_ms runs 0 to "
+                "600000. pwa is "
                 "per-beat pulse wave amplitude; accel is the per-beat motion score, ALREADY "
                 "SHIFTED 20 s earlier to compensate for lag in the accel score, so plot pwa "
                 "and accel against rel_ms directly with no further correction. tier is beat "
