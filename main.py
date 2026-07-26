@@ -705,7 +705,8 @@ def _mode_label(m: str) -> str:
     return {"sleep": "Sleep", "rest": "Rest", "stand": "Stand", "breathwork": "Breathwork",
             "circadian": "Circadian", "circadian_rhythm": "Circadian Rhythm",
             "circadian_episodes": "Circadian Episodes",
-            "sleep_pwr": "Pulse Wave Rhythms"}.get(m, m.capitalize())
+            "sleep_pwr": "Pulse Wave Rhythms",
+            "sleep_pwr_episodes": "Pulse Wave Rhythms Episodes"}.get(m, m.capitalize())
 
 
 # ---- Admin page ----------------------------------------------------------
@@ -1603,7 +1604,7 @@ DATA_CHAR_BUDGET = 220_000
 # Per-recording metric master modes: bundled into an Individual analysis and
 # offered for group comparison. One compact row per recording each.
 RESEARCH_MODES = ["sleep", "rest", "stand", "breathwork", "circadian", "circadian_rhythm",
-                  "circadian_episodes", "sleep_pwr"]
+                  "circadian_episodes", "sleep_pwr", "sleep_pwr_episodes"]
 
 # Waveform strip data (raw PPG for sinus-control + episode strips). NOT a metric
 # master — it's long-format samples, pulled on demand when the researcher asks to
@@ -1646,23 +1647,15 @@ def _summarize_csv(csv_text: str) -> str:
 def _mode_guide(md: str) -> str:
     """One line telling the agent what a mode's columns mean."""
     if md == "sleep_pwr_strips":
-        return ("Pulse Wave Rhythms strips. Columns: strip_id, rel_ms, pwa. strip_id is "
-                "<recording>#d1..#d5 for the disturbance segment and <recording>#c1..#c5 "
-                "for the control segment. Within each segment the five strips are "
-                "consecutive 2-min windows forming one continuous 10-min segment, so "
-                "concatenate them in strip order (rel_ms restarts at 0 in each strip: add "
-                "120000 ms per preceding strip) and plot each segment as ONE continuous "
-                "trace, not five panels. Recordings made before the control was widened "
-                "have a single 2-min <recording>#c instead of #c1..#c5 — handle both. "
-                "pwa is per-beat pulse wave amplitude (~1 Hz). Before plotting, drop "
-                "artifact beats above median + 8*MAD (motion spikes reach ~600k against a "
-                "~10k baseline and otherwise destroy the y-axis) and say how many were "
-                "dropped. Give both segments the same y-scale, and the same seconds-per-inch "
-                "on x, so a shorter control is not stretched to match. For clock time, join "
-                "to the sleep_pwr selection log on the recording timestamp in strip_id and "
-                "use disturbance_start / control_start as each segment's start; do not "
-                "infer the time from strip_id alone. The amplitude envelope is the signal "
-                "(cyclic dips in the disturbance segment, flatter control).")
+        return ("Pulse Wave Rhythms strip. Columns: strip_id, rel_ms, pwa, accel, tier. "
+                "strip_id is <recording_ts>#strip — ONE continuous 10-minute segment per "
+                "recording, so no concatenation is needed. rel_ms runs 0 to 600000. pwa is "
+                "per-beat pulse wave amplitude; accel is the per-beat motion score, ALREADY "
+                "SHIFTED 20 s earlier to compensate for lag in the accel score, so plot pwa "
+                "and accel against rel_ms directly with no further correction. tier is beat "
+                "quality (T1 is clean). Plot pwa on top and accel beneath on a shared x-axis; "
+                "the amplitude envelope is the signal — sustained dips are the events, and a "
+                "quiet accel trace under them shows they are not movement.")
     if md == "circadian_strips":
         return ("Irregular-rhythm strips. Columns: recording_ts, strip_type (sinus/episode), "
                 "strip_id, rel_ms, ppg_green. Each strip_id is one ~30s strip; plot ppg_green "
@@ -1671,7 +1664,18 @@ def _mode_guide(md: str) -> str:
     if md == "circadian_episodes":
         return "Irregular-rhythm episode log: one row per detected episode (timing + duration)."
     if md == "sleep_pwr":
-        return "Pulse Wave Rhythms selection log: one row per recording (segment times + scores)."
+        return ("Pulse Wave Rhythms summary: one row per recording. Columns: n_episodes, "
+                "episode_min_total (total minutes spent in episodes), drops_total, "
+                "strip_start, strip_mean_depth.")
+    if md == "sleep_pwr_episodes":
+        return ("Pulse Wave Rhythms episode log: one row PER EPISODE, so a recording "
+                "contributes several rows. Columns: recording_ts, episode_id, start, end, "
+                "dur_min, mean_depth (mean pulse-wave-amplitude drop depth, 0-1), max_depth, "
+                "peak_score. Episodes are stretches where sustained amplitude drops recur; "
+                "they never overlap. Times are local with a UTC offset — keep them local. "
+                "These index arousals, which is why they can exceed what oximetry would "
+                "show; do not describe them as apnea, SDB, or a breathing diagnosis, and do "
+                "not treat depth or score as a severity measure.")
     return f"{md} session metrics: one row per recording."
 
 
