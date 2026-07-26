@@ -67,6 +67,27 @@ KIND_BY_PROVIDER_PREFIX = {v: k for k, v in PROVIDER_PREFIX.items()}
 KIND_BY_PERSON_PREFIX   = {v: k for k, v in PERSON_PREFIX.items()}
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# ---- Log noise ------------------------------------------------------------
+# Render health-checks /health every few seconds. Those access-log lines bury
+# everything worth reading, so they are filtered out by default. Set
+# VAGIS_LOG_HEALTH=1 to see them again when debugging the health check itself.
+import logging as _logging
+
+
+class _QuietPolling(_logging.Filter):
+    NOISY = ("/health", "/favicon.ico")
+
+    def filter(self, record: _logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return not any(p in msg for p in self.NOISY)
+
+
+if os.environ.get("VAGIS_LOG_HEALTH", "").strip() not in ("1", "true", "True"):
+    _logging.getLogger("uvicorn.access").addFilter(_QuietPolling())
+
 app = FastAPI(title="Vagis Server")
 
 
