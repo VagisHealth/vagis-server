@@ -1434,9 +1434,9 @@ const METRICS = {
               "recovery_tau_sec","recovery_hr_drop","recovery_confidence"],
   circadian_rhythm: [], circadian_episodes: [],
   circadian_strips: ["ppg_green"],
-  sleep_pwr: ["n_episodes","episode_min_total","drops_total","strip_mean_depth"],
   /* episode count saturates once episodes cover most of the night — total
      minutes and drop count carry the burden signal, not n_episodes */
+  sleep_pwr: ["n_episodes","episode_min_total","drops_total","strip_mean_depth"],
   sleep_pwr_episodes: [],
   sleep_pwr_strips: ["pwa","accel"]
 };
@@ -1528,8 +1528,14 @@ const PWR_CONTEXT = [
   "Episode count saturates once episodes cover much of the night, so total episode",
   "minutes and drop count carry the burden signal — not the number of episodes.",
   "",
-  "All timestamps are local and carry a UTC offset. Parse them and strip the offset",
-  "WITHOUT converting to UTC, so everything reads and plots as local clock time.",
+  "TIMESTAMPS — get this exactly right. Every timestamp column (start, end, iso_ts,",
+  "strip_start) is ALREADY local clock time, written with a trailing UTC offset such as",
+  "2026-07-27T22:40:15-07:00. The clock part is what you want. Do NOT use timezone",
+  "conversion of any kind: no utc=True, no tz_convert, no tz_localize. Instead take the",
+  "first 19 characters of the string and parse that, e.g.",
+  "    pd.to_datetime(df['start'].str.slice(0, 19))",
+  "That yields naive local time and cannot be shifted by anything. A 22:40 recording must",
+  "read 22:40 in every table and on every axis. Verify one value before you finish.",
   "algo_version records the detection thresholds behind each row. Use only rows whose",
   "algo_version matches the most recent recording's, and state which version that is."
 ].join("\n");
@@ -1546,13 +1552,13 @@ const PWR_PRESETS = {
     "  Bottom — accel, black trace, about one third the height of the top panel",
     "",
     "Y-AXIS RANGES — fixed on both panels, so every strip is directly comparable:",
-    "  accel : ALWAYS 0 to 10, on every sample without exception. Values above 10 are",
-    "          movement and simply run off the top; do not rescale to fit them and do",
-    "          not autoscale, even when the whole trace sits near 1.",
     "  pwa   : ALWAYS 0 to 50000, on every sample without exception. Do not autoscale",
     "          and do not rescale to fit outliers — beats above 50000 are motion and",
     "          simply run off the top. Draw the full trace, clipped at the axis top, and",
     "          say how many beats went above it.",
+    "  accel : ALWAYS 0 to 10, on every sample without exception. Values above 10 are",
+    "          movement and simply run off the top; do not rescale to fit them and do",
+    "          not autoscale, even when the whole trace sits near 1.",
     "",
     "Build the x-axis by adding rel_ms to strip_start and label it 'Time of day' as HH:MM.",
     "Y labels 'Pulse Wave Amplitude' and 'Accel'.",
@@ -1566,39 +1572,28 @@ const PWR_PRESETS = {
   ].join("\n"),
 
   sleep_pwr_episodes: [
-    "TASK — Pulse Wave Rhythms episodes.",
+    "TASK — Pulse Wave Rhythms episodes. Produce a TABLE ONLY.",
     "Use the sleep_pwr_episodes file. One row per episode; episodes never overlap.",
     "",
-    "TABLE every episode for the selected recordings: episode_id, start and end as HH:MM,",
-    "dur_min, mean_depth, max_depth, peak_score. Order by start. Above the table give the",
-    "recording date, the number of episodes and the total episode minutes.",
+    "One row per episode, ordered by start:",
+    "  recording_date, episode_id, start (HH:MM), end (HH:MM), dur_min, mean_depth,",
+    "  max_depth, peak_score",
+    "Finish with a total row: number of episodes and total episode minutes.",
     "",
-    "FIGURE — one panel per recording, stacked, sharing a common clock x-axis from the",
-    "first episode start to the last episode end: draw each episode as a horizontal bar",
-    "spanning its start to end, shaded by mean_depth. X-axis 'Time of day' as HH:MM.",
-    "This shows when in the night the episodes cluster.",
-    "",
-    "REPORT total episode minutes, the longest and the deepest episode, and where in the",
-    "night they concentrate. If several recordings are selected, compare total episode",
-    "minutes between them and say whether the pattern sits at a consistent time of night."
+    "No figure. No commentary, no interpretation, no summary paragraph, no caveats.",
+    "Output the table and nothing else."
   ].join("\n"),
 
   sleep_pwr: [
-    "TASK — Pulse Wave Rhythms summary across recordings.",
-    "Use the sleep_pwr file. One row per recording: n_episodes, episode_min_total,",
-    "drops_total, strip_start, strip_mean_depth.",
+    "TASK — Pulse Wave Rhythms summary. Produce a TABLE ONLY.",
+    "Use the sleep_pwr file. One row per recording.",
     "",
-    "TABLE every recording: recording_date, n_episodes, episode_min_total, drops_total,",
-    "strip_mean_depth. Order by date.",
+    "One row per recording, ordered by date:",
+    "  recording_date, n_episodes, episode_min_total, drops_total, strip_start (HH:MM),",
+    "  strip_mean_depth",
     "",
-    "FIGURE — episode_min_total against recording_date as a bar chart, with drops_total",
-    "overlaid as a line on a second y-axis. X-axis as dates, y labels 'Episode minutes'",
-    "and 'Drops'. Title: Pulse Wave Rhythms burden - <subject>.",
-    "",
-    "REPORT the range and median of episode_min_total and drops_total across the",
-    "recordings, whether the burden is stable or trending, and which night is highest and",
-    "lowest. With fewer than three recordings, state that plainly and do not describe a",
-    "trend. Remember that n_episodes saturates — lead with minutes and drops."
+    "No figure. No commentary, no interpretation, no summary paragraph, no caveats.",
+    "Output the table and nothing else."
   ].join("\n")
 };
 
@@ -1645,7 +1640,10 @@ function buildPrompt() {
   const dl = dateLine();
   if (dl) parts.push(dl);
   if (metric && metric !== 'all') parts.push("FOCUS on the metric: " + metric + ".");
-  parts.push("", PWR_CONTEXT, "", "One code execution, one figure.");
+  const tableOnly = (mode === 'sleep_pwr' || mode === 'sleep_pwr_episodes');
+  parts.push("", PWR_CONTEXT, "",
+             tableOnly ? "One code execution. Table only — no figure."
+                       : "One code execution, one figure.");
   box.value = parts.join("\n");
   box.focus();
 }
