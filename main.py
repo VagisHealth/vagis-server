@@ -1435,6 +1435,8 @@ const METRICS = {
   circadian_rhythm: [], circadian_episodes: [],
   circadian_strips: ["ppg_green"],
   sleep_pwr: ["n_episodes","episode_min_total","drops_total","strip_mean_depth"],
+  /* episode count saturates once episodes cover most of the night — total
+     minutes and drop count carry the burden signal, not n_episodes */
   sleep_pwr_episodes: [],
   sleep_pwr_strips: ["pwa","accel"]
 };
@@ -1504,11 +1506,139 @@ function clearPreset() {
   document.getElementById('input').value = '';
 }
 
-/* The Analysis dropdown is not populated yet — the preset prompt text is the
-   next piece of work. Build prompt fills the composer, editable before sending. */
+/* ---------------- preset prompt text ----------------
+   Written so the same selection produces the same analysis every time. The
+   agent starts each session with no context, so everything it needs to read
+   these files correctly — and every caveat it must not overstate — lives here. */
+
+const PWR_CONTEXT = [
+  "BACKGROUND — read before analysing.",
+  "Pulse Wave Rhythms measures sustained falls in pulse wave amplitude during sleep.",
+  "Amplitude is averaged onto a 1-second grid from clean beats only, and a fall is",
+  "counted when it drops below a rolling baseline and is held for several seconds.",
+  "Falls occurring near body movement are discarded, so what remains is not motion.",
+  "",
+  "These falls index sympathetic AROUSALS. They are not oxygen desaturations and they",
+  "outnumber them roughly three to one, because arousals without desaturation are",
+  "invisible to oximetry. That is the point of the measure, not a shortcoming.",
+  "Therefore: never describe these as apnea, SDB, hypopnea or any breathing diagnosis;",
+  "never present depth or peak_score as a severity score; never convert counts into an",
+  "events-per-hour index. Report what was measured and let the researcher judge.",
+  "",
+  "Episode count saturates once episodes cover much of the night, so total episode",
+  "minutes and drop count carry the burden signal — not the number of episodes.",
+  "",
+  "All timestamps are local and carry a UTC offset. Parse them and strip the offset",
+  "WITHOUT converting to UTC, so everything reads and plots as local clock time.",
+  "algo_version records the detection thresholds behind each row. Use only rows whose",
+  "algo_version matches the most recent recording's, and state which version that is."
+].join("\n");
+
+const PWR_PRESETS = {
+  sleep_pwr_strips: [
+    "TASK — Pulse Wave Rhythms strip.",
+    "Use the sleep_pwr_strips file (recording_ts, strip_id, rel_ms, pwa, accel, tier)",
+    "together with sleep_pwr for strip_start. Each recording contributes ONE continuous",
+    "10-minute strip, so no concatenation is needed.",
+    "",
+    "FIGURE — two stacked panels, full width, sharing one x-axis:",
+    "  Top    — pwa, black trace, y from 0 to 3x the median pwa, clipped at the top",
+    "           rather than rescaled so a few extreme beats cannot flatten the trace",
+    "  Bottom — accel, black trace, about one third the height of the top panel",
+    "Build the x-axis by adding rel_ms to strip_start and label it 'Time of day' as HH:MM.",
+    "Y labels 'Pulse Wave Amplitude' and 'Accel'.",
+    "Title: Pulse Wave Rhythms strip - <subject> - <recording date>.",
+    "The accel column is ALREADY time-aligned to pwa — do not shift it.",
+    "Draw nothing else: no shading, no markers, no vertical lines, no arrows.",
+    "",
+    "REPORT the recording date, the clock window the strip covers, the shape of the",
+    "amplitude trace, and whether accel stays quiet throughout or whether any fall",
+    "coincides with movement. The accel panel is the evidence that the falls are real."
+  ].join("\n"),
+
+  sleep_pwr_episodes: [
+    "TASK — Pulse Wave Rhythms episodes.",
+    "Use the sleep_pwr_episodes file. One row per episode; episodes never overlap.",
+    "",
+    "TABLE every episode for the selected recordings: episode_id, start and end as HH:MM,",
+    "dur_min, mean_depth, max_depth, peak_score. Order by start. Above the table give the",
+    "recording date, the number of episodes and the total episode minutes.",
+    "",
+    "FIGURE — one panel per recording, stacked, sharing a common clock x-axis from the",
+    "first episode start to the last episode end: draw each episode as a horizontal bar",
+    "spanning its start to end, shaded by mean_depth. X-axis 'Time of day' as HH:MM.",
+    "This shows when in the night the episodes cluster.",
+    "",
+    "REPORT total episode minutes, the longest and the deepest episode, and where in the",
+    "night they concentrate. If several recordings are selected, compare total episode",
+    "minutes between them and say whether the pattern sits at a consistent time of night."
+  ].join("\n"),
+
+  sleep_pwr: [
+    "TASK — Pulse Wave Rhythms summary across recordings.",
+    "Use the sleep_pwr file. One row per recording: n_episodes, episode_min_total,",
+    "drops_total, strip_start, strip_mean_depth.",
+    "",
+    "TABLE every recording: recording_date, n_episodes, episode_min_total, drops_total,",
+    "strip_mean_depth. Order by date.",
+    "",
+    "FIGURE — episode_min_total against recording_date as a bar chart, with drops_total",
+    "overlaid as a line on a second y-axis. X-axis as dates, y labels 'Episode minutes'",
+    "and 'Drops'. Title: Pulse Wave Rhythms burden - <subject>.",
+    "",
+    "REPORT the range and median of episode_min_total and drops_total across the",
+    "recordings, whether the burden is stable or trending, and which night is highest and",
+    "lowest. With fewer than three recordings, state that plainly and do not describe a",
+    "trend. Remember that n_episodes saturates — lead with minutes and drops."
+  ].join("\n")
+};
+
+function scopeLine() {
+  const v = pScopeEl.value;
+  if (v === 'individual') return "SCOPE: the single selected subject.";
+  if (v === 'group1')     return "SCOPE: the subjects in Group 1, analysed together.";
+  if (v === 'group2')     return "SCOPE: the subjects in Group 2, analysed together.";
+  if (v === 'groupcmp')   return "SCOPE: compare Group 1 against Group 2. Report each group separately, then the difference between them.";
+  if (v === 'indcmp' || v === 'g1cmp') {
+    const a1 = document.getElementById('pA1').value, a2 = document.getElementById('pA2').value;
+    const b1 = document.getElementById('pB1').value, b2 = document.getElementById('pB2').value;
+    const who = (v === 'indcmp') ? "the single selected subject" : "the subjects in Group 1";
+    if (!a1 || !a2 || !b1 || !b2) return "SCOPE: " + who + ", comparing two periods (dates not set — ask before analysing).";
+    return "SCOPE: " + who + ", split into two periods by recording date and compared.\n"
+         + "  Period A: " + a1 + " to " + a2 + "\n"
+         + "  Period B: " + b1 + " to " + b2 + "\n"
+         + "Report each period separately, then the difference between them.";
+  }
+  return "SCOPE: the current selection.";
+}
+
+function dateLine() {
+  if (pScopeEl.value === 'indcmp' || pScopeEl.value === 'g1cmp') return "";
+  if (allDates) return "DATES: use every recording available.";
+  const a = document.getElementById('pStart').value, b = document.getElementById('pEnd').value;
+  if (!a && !b) return "DATES: use every recording available.";
+  if (a && b)   return "DATES: use recordings made from " + a + " to " + b + " inclusive.";
+  if (a)        return "DATES: use recordings made on or after " + a + ".";
+  return "DATES: use recordings made on or before " + b + ".";
+}
+
 function buildPrompt() {
-  document.getElementById('input').value = '[preset prompt text not written yet]';
-  document.getElementById('input').focus();
+  const mode = pModeEl.value;
+  const box = document.getElementById('input');
+  if (!mode) { box.value = "Choose a Mode first."; box.focus(); return; }
+  const preset = PWR_PRESETS[mode];
+  if (!preset) {
+    box.value = "No preset is written for this mode yet — type your request instead.";
+    box.focus(); return;
+  }
+  const metric = pMetricEl.value;
+  const parts = [preset, "", scopeLine()];
+  const dl = dateLine();
+  if (dl) parts.push(dl);
+  if (metric && metric !== 'all') parts.push("FOCUS on the metric: " + metric + ".");
+  parts.push("", PWR_CONTEXT, "", "One code execution, one figure.");
+  box.value = parts.join("\n");
+  box.focus();
 }
 
 fillMetrics();
@@ -1887,7 +2017,7 @@ def _mode_guide(md: str) -> str:
     """One line telling the agent what a mode's columns mean."""
     if md == "sleep_pwr_strips":
         return ("Pulse Wave Rhythms strip. Columns: recording_ts, strip_id, rel_ms, pwa, "
-                "accel, tier. strip_id is <recording_ts>#strip — ONE continuous 10-minute "
+                "accel, tier, algo_version. strip_id is <recording_ts>#strip — ONE continuous 10-minute "
                 "segment per recording, so no concatenation is needed. Join to the "
                 "sleep_pwr and sleep_pwr_episodes files on recording_ts. rel_ms runs 0 to "
                 "600000. pwa is "
@@ -1907,12 +2037,16 @@ def _mode_guide(md: str) -> str:
     if md == "sleep_pwr":
         return ("Pulse Wave Rhythms summary: one row per recording. Columns: n_episodes, "
                 "episode_min_total (total minutes spent in episodes), drops_total, "
-                "strip_start, strip_mean_depth.")
+                "strip_start, strip_mean_depth, algo_version. algo_version records the "
+                "detection thresholds that produced the row; rows with different "
+                "algo_version values are not directly comparable.")
     if md == "sleep_pwr_episodes":
         return ("Pulse Wave Rhythms episode log: one row PER EPISODE, so a recording "
                 "contributes several rows. Columns: recording_ts, episode_id, start, end, "
                 "dur_min, mean_depth (mean pulse-wave-amplitude drop depth, 0-1), max_depth, "
-                "peak_score. Episodes are stretches where sustained amplitude drops recur; "
+                "peak_score, algo_version (the detection thresholds behind the row; rows "
+                "with different algo_version values are not directly comparable). "
+                "Episodes are stretches where sustained amplitude drops recur; "
                 "they never overlap. Times are local with a UTC offset — keep them local. "
                 "These index arousals, which is why they can exceed what oximetry would "
                 "show; do not describe them as apnea, SDB, or a breathing diagnosis, and do "
