@@ -1436,7 +1436,7 @@ const METRICS = {
   circadian_strips: ["ppg_green"],
   /* night_duty_pct is the burden measure — episode count saturates once
      episodes cover much of the night */
-  sleep_pwr: ["n_episodes","episode_min_total","night_duty_pct","n_strips"],
+  sleep_pwr: ["n_episodes","episode_min_total","night_duty_pct","control_duty_pct"],
   sleep_pwr_episodes: [],
   sleep_pwr_strips: ["pwa","accel"]
 };
@@ -1533,9 +1533,14 @@ const PWR_CONTEXT = [
   "night_duty_pct is the best night-to-night burden measure. Episode count saturates",
   "once episodes cover much of the night, so lead with duty and episode minutes.",
   "",
-  "The strip is the highest-duty 10 minutes inside the night's strongest episode that",
-  "passes a movement check. It shows the strongest stretch of that one episode, not",
-  "the worst of the night; do not present it as representative of the whole recording.",
+  "Two strips are exported. The DISTURBANCE strip is the highest-duty 10 minutes",
+  "inside whichever of the night's three longest episodes offers it — episode length",
+  "tracks disturbance better than duty alone. The CONTROL strip is the quietest 10",
+  "minutes of the night, chosen with a movement gate so that low duty means settled",
+  "rather than merely noisy. The control is the subject's own baseline, which makes",
+  "the comparison within-subject and free of any assumption about normal amplitude.",
+  "Neither strip is the worst stretch of the night; do not present either as",
+  "representative of the whole recording.",
   "",
   "TIMESTAMPS — get this exactly right. Every timestamp column (start, end, iso_ts,",
   "strip_start) is ALREADY local clock time, written with a trailing UTC offset such as",
@@ -1551,35 +1556,44 @@ const PWR_CONTEXT = [
 
 const PWR_PRESETS = {
   sleep_pwr_strips: [
-    "TASK — Pulse Wave Rhythms strip.",
+    "TASK — Pulse Wave Rhythms strips, disturbance against control.",
     "Use the sleep_pwr_strips file (recording_ts, episode_id, strip_id, rel_ms, pwa,",
-    "accel, tier) with sleep_pwr_episodes for the strip's start and movement figures.",
-    "Each recording contributes ONE continuous 10-minute strip, taken from its",
-    "strongest episode. episode_id says which episode it came from.",
+    "accel, tier). Each recording holds TWO 10-minute strips: the DISTURBANCE strip,",
+    "whose episode_id is an episode number (E1, E2, ...), and the CONTROL strip, whose",
+    "episode_id is the literal string CONTROL. Split on episode_id.",
+    "Take the disturbance strip's clock start from sleep_pwr_episodes (strip_start on",
+    "the matching episode_id) and the control's from sleep_pwr (control_start).",
     "",
-    "FIGURE — two stacked panels, full width, sharing one x-axis:",
-    "  Top    — pwa, black trace",
-    "  Bottom — accel, black trace, about one third the height of the top panel",
+    "FIGURE — four panels stacked, built in one pass with a single subplots call:",
+    "  1. DISTURBANCE pwa, black trace",
+    "  2. DISTURBANCE accel, black trace, about one third the height of panel 1",
+    "  3. CONTROL pwa, black trace",
+    "  4. CONTROL accel, black trace, about one third the height of panel 3",
+    "Label the two pwa panels 'Disturbance' and 'Control' with their clock windows.",
     "",
-    "Y-AXIS RANGES — fixed on both panels, so strips compare directly:",
-    "  pwa   : ALWAYS 0 to 50000. Do not autoscale and do not rescale to fit outliers —",
-    "          beats above 50000 are motion and simply run off the top. Draw the full",
-    "          trace, clipped at the axis top, and say how many beats went above it.",
-    "  accel : ALWAYS 0 to 10, even when the whole trace sits near 1.",
+    "Y-AXIS RANGES — identical on both strips, so the contrast is real and not an",
+    "artefact of scaling:",
+    "  pwa   : ALWAYS 0 to 50000. Do not autoscale. Beats above 50000 are motion and",
+    "          run off the top; draw the full trace clipped at the axis top and say",
+    "          how many beats went above it in each strip.",
+    "  accel : ALWAYS 0 to 10, even when a trace sits near 1.",
     "",
-    "Build the x-axis by adding rel_ms to strip_start and label it 'Time of day' as",
-    "HH:MM. Y labels 'Pulse Wave Amplitude' and 'Accel'.",
-    "Title: Pulse Wave Rhythms strip - <subject> - <recording date>.",
-    "The accel column is ALREADY time-aligned to pwa — do not shift it.",
+    "Build each x-axis by adding rel_ms to that strip's own start, labelled 'Time of",
+    "day' as HH:MM. Y labels 'Pulse Wave Amplitude' and 'Accel'.",
+    "Title: Pulse Wave Rhythms - <subject> - <recording date>.",
+    "accel is ALREADY time-aligned to pwa — do not shift it.",
     "Draw nothing else: no shading, no markers, no vertical lines, no arrows.",
     "",
-    "REPORT briefly: the recording date, which episode the strip came from and its",
-    "clock window, then strip_duty_pct, strip_move_sec and strip_peak_accel read",
-    "straight from sleep_pwr_episodes — do not recompute them. Finish with one or two",
-    "sentences on where the suppression sits and whether it looks clean, judged from",
-    "those two movement numbers. Never call the accel trace quiet, calm or flat without",
-    "quoting them — a strip can look flat at this scale and still hold a 15-second",
-    "burst peaking above 30.",
+    "REPORT briefly: the recording date, which episode the disturbance strip came from",
+    "and both clock windows, then a two-row table read straight from the files — do not",
+    "recompute anything:",
+    "  disturbance: strip_duty_pct, strip_move_sec, strip_peak_accel",
+    "  control    : control_duty_pct, control_move_sec, control_peak_accel",
+    "Finish with one or two sentences contrasting the two traces. Never call either",
+    "accel trace quiet, calm or flat without quoting its move and peak numbers — a",
+    "strip can look flat at this scale and still hold a 15-second burst peaking above",
+    "30. The control is there to show what this subject's amplitude looks like when",
+    "undisturbed; say plainly whether the disturbance strip differs from it.",
     "Nothing else. No extra analysis, no per-second scanning of the accel channel."
   ].join("\n"),
 
@@ -2036,39 +2050,42 @@ def _mode_guide(md: str) -> str:
     """One line telling the agent what a mode's columns mean."""
     if md == "sleep_pwr_strips":
         return ("Pulse Wave Rhythms strips. Columns: recording_ts, episode_id, strip_id, "
-                "rel_ms, pwa, accel, tier, algo_version. A recording contributes ONE "
-                "continuous 10-minute strip, taken from its strongest episode; "
-                "episode_id says which. strip_id is "
-                "<recording_ts>#<episode_id>. rel_ms runs 0 to 600000 within each strip. "
-                "pwa is per-beat pulse wave amplitude; accel is the per-beat motion score, "
-                "exported as recorded and already time-aligned to pwa — do not shift it. "
-                "tier is beat quality (T1 is clean). Join to sleep_pwr_episodes on "
-                "recording_ts + episode_id for each strip's clock start and its "
-                "strip_move_sec and strip_peak_accel.")
+                "rel_ms, pwa, accel, tier, algo_version. Each recording contributes TWO "
+                "continuous 10-minute strips: the DISTURBANCE strip, taken from one of the "
+                "night's longest episodes, where episode_id is that episode's id (E1, E2, "
+                "...); and the CONTROL strip, the quietest 10 minutes of the night, where "
+                "episode_id is the literal string CONTROL. Split on episode_id and plot "
+                "both on identical axes — the contrast is the point. rel_ms runs 0 to "
+                "600000 within each strip. accel is exported as recorded and is already "
+                "time-aligned to pwa — do not shift it. tier is beat quality (T1 is clean). "
+                "Join to sleep_pwr_episodes for the disturbance strip's clock start and to "
+                "sleep_pwr for the control's.")
     if md == "sleep_pwr":
         return ("Pulse Wave Rhythms summary: one row per recording. Columns: n_episodes, "
-                "episode_min_total (total minutes spent in episodes), night_duty_pct, "
-                "n_strips, algo_version. DUTY is the percentage of time spent with pulse "
-                "wave amplitude more than 70% below its running baseline; night_duty_pct "
-                "is that figure for the whole recording and is the best night-to-night "
-                "burden measure. algo_version records the settings that produced the row; "
-                "rows with different algo_version values are not directly comparable.")
+                "episode_min_total, night_duty_pct, control_start, control_duty_pct, "
+                "control_move_sec, control_peak_accel, algo_version. DUTY is the percentage "
+                "of time spent with pulse wave amplitude more than 70% below its running "
+                "baseline; night_duty_pct is that figure for the whole recording and is the "
+                "best night-to-night burden measure. The control_* columns describe the "
+                "quietest 10 minutes of the night, which the control strip is drawn from. "
+                "algo_version records the settings behind the row; rows with different "
+                "algo_version values are not directly comparable.")
     if md == "sleep_pwr_episodes":
         return ("Pulse Wave Rhythms episode log: one row PER EPISODE, so a recording "
                 "contributes several rows. Columns: recording_ts, episode_id, start, end, "
                 "dur_min, duty_mean_pct, duty_max_pct, strip_start, strip_duty_pct, "
-                "strip_move_sec, strip_peak_accel, algo_version. An episode is a "
-                "contiguous stretch where duty stays at or above 1%; episodes never "
-                "overlap. The strip_* columns describe the 10-minute strip taken from that "
-                "episode and are BLANK when the episode has none — only the strongest "
-                "episode gets a strip. strip_move_sec is the number of seconds in that strip with accel "
-                "above 3 and strip_peak_accel its highest accel; read them before calling "
-                "a strip clean. Times are local with a UTC offset — keep them local. "
-                "Nothing here counts discrete events: duty measures how much of the time "
-                "amplitude is suppressed, which is why there is no drop count or depth. "
-                "These index arousals, which is why they can exceed what oximetry would "
-                "show; do not describe them as apnea, SDB or a breathing diagnosis, and do "
-                "not treat duty as a severity measure.")
+                "strip_move_sec, strip_peak_accel, algo_version. An episode is a contiguous "
+                "stretch where duty stays at or above 1%, lasting at least 5 minutes; "
+                "episodes never overlap and cannot run through movement. The strip_* "
+                "columns are filled only for the one episode the disturbance strip came "
+                "from and are BLANK for the rest. strip_move_sec is the number of seconds "
+                "in that strip with accel above 3 and strip_peak_accel its highest accel; "
+                "read them before calling a strip clean. Times are local with a UTC offset "
+                "— keep them local. Nothing here counts discrete events: duty measures how "
+                "much of the time amplitude is suppressed, which is why there is no drop "
+                "count or depth. These index arousals, which is why they can exceed what "
+                "oximetry would show; do not describe them as apnea, SDB or a breathing "
+                "diagnosis, and do not treat duty as a severity measure.")
     return f"{md} session metrics: one row per recording."
 
 
