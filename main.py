@@ -1434,9 +1434,9 @@ const METRICS = {
               "recovery_tau_sec","recovery_hr_drop","recovery_confidence"],
   circadian_rhythm: [], circadian_episodes: [],
   circadian_strips: ["ppg_green"],
-  /* episode count saturates once episodes cover most of the night — total
-     minutes and drop count carry the burden signal, not n_episodes */
-  sleep_pwr: ["n_episodes","episode_min_total","drops_total","strip_mean_depth"],
+  /* night_duty_pct is the burden measure — episode count saturates once
+     episodes cover much of the night */
+  sleep_pwr: ["n_episodes","episode_min_total","night_duty_pct","strip_duty_pct"],
   sleep_pwr_episodes: [],
   sleep_pwr_strips: ["pwa","accel"]
 };
@@ -1513,20 +1513,25 @@ function clearPreset() {
 
 const PWR_CONTEXT = [
   "BACKGROUND — read before analysing.",
-  "Pulse Wave Rhythms measures sustained falls in pulse wave amplitude during sleep.",
-  "Amplitude is averaged onto a 1-second grid from clean beats only, and a fall is",
-  "counted when it drops below a rolling baseline and is held for several seconds.",
-  "Falls occurring near body movement are discarded, so what remains is not motion.",
+  "Pulse Wave Rhythms measures how much of the night pulse wave amplitude spends",
+  "suppressed. Amplitude is averaged onto a 1-second grid from clean beats only; a",
+  "second counts as SUPPRESSED when it sits more than 70% below its running baseline.",
+  "DUTY is the percentage of suppressed seconds over a rolling 10 minutes. An EPISODE",
+  "is a contiguous stretch where duty stays at or above 1%, lasting at least 5 minutes.",
   "",
-  "These falls index sympathetic AROUSALS. They are not oxygen desaturations and they",
-  "outnumber them roughly three to one, because arousals without desaturation are",
-  "invisible to oximetry. That is the point of the measure, not a shortcoming.",
-  "Therefore: never describe these as apnea, SDB, hypopnea or any breathing diagnosis;",
-  "never present depth or peak_score as a severity score; never convert counts into an",
-  "events-per-hour index. Report what was measured and let the researcher judge.",
+  "Nothing here counts discrete events, deliberately. Counting drops needed both a",
+  "depth threshold and a minimum duration, and under-counted badly — a strip with a",
+  "dozen visible dips reported six. Duty needs neither, and does not care whether",
+  "suppression arrives as several clean falls or one long trough. So do not report a",
+  "number of drops, an events-per-hour index, or a drop depth: they are not in the data.",
   "",
-  "Episode count saturates once episodes cover much of the night, so total episode",
-  "minutes and drop count carry the burden signal — not the number of episodes.",
+  "Suppression indexes sympathetic AROUSALS. It is not oxygen desaturation and picks up",
+  "arousals that never desaturate, which oximetry cannot see. That is the point of the",
+  "measure, not a shortcoming. Never describe it as apnea, SDB, hypopnea or any",
+  "breathing diagnosis, and never present duty as a severity score.",
+  "",
+  "night_duty_pct is the best night-to-night burden measure. Episode count saturates",
+  "once episodes cover much of the night, so lead with duty and episode minutes.",
   "",
   "TIMESTAMPS — get this exactly right. Every timestamp column (start, end, iso_ts,",
   "strip_start) is ALREADY local clock time, written with a trailing UTC offset such as",
@@ -1567,8 +1572,9 @@ const PWR_PRESETS = {
     "Draw nothing else: no shading, no markers, no vertical lines, no arrows.",
     "",
     "REPORT the recording date, the clock window the strip covers, the shape of the",
-    "amplitude trace, and whether accel stays quiet throughout or whether any fall",
-    "coincides with movement. The accel panel is the evidence that the falls are real."
+    "amplitude trace, and whether accel stays quiet throughout or whether any period of",
+    "suppression coincides with movement. The accel panel is the evidence that the",
+    "suppression is real."
   ].join("\n"),
 
   sleep_pwr_episodes: [
@@ -1576,8 +1582,8 @@ const PWR_PRESETS = {
     "Use the sleep_pwr_episodes file. One row per episode; episodes never overlap.",
     "",
     "One row per episode, ordered by start:",
-    "  recording_date, episode_id, start (HH:MM), end (HH:MM), dur_min, mean_depth,",
-    "  max_depth, peak_score",
+    "  recording_date, episode_id, start (HH:MM), end (HH:MM), dur_min,",
+    "  duty_mean_pct, duty_max_pct",
     "Finish with a total row: number of episodes and total episode minutes.",
     "",
     "No figure. No commentary, no interpretation, no summary paragraph, no caveats.",
@@ -1589,8 +1595,8 @@ const PWR_PRESETS = {
     "Use the sleep_pwr file. One row per recording.",
     "",
     "One row per recording, ordered by date:",
-    "  recording_date, n_episodes, episode_min_total, drops_total, strip_start (HH:MM),",
-    "  strip_mean_depth",
+    "  recording_date, n_episodes, episode_min_total, night_duty_pct,",
+    "  strip_start (HH:MM), strip_duty_pct",
     "",
     "No figure. No commentary, no interpretation, no summary paragraph, no caveats.",
     "Output the table and nothing else."
@@ -2024,40 +2030,35 @@ def _mode_guide(md: str) -> str:
     """One line telling the agent what a mode's columns mean."""
     if md == "sleep_pwr_strips":
         return ("Pulse Wave Rhythms strip. Columns: recording_ts, strip_id, rel_ms, pwa, "
-                "accel, tier, algo_version. strip_id is <recording_ts>#strip — ONE continuous 10-minute "
-                "segment per recording, so no concatenation is needed. Join to the "
-                "sleep_pwr and sleep_pwr_episodes files on recording_ts. rel_ms runs 0 to "
-                "600000. pwa is "
-                "per-beat pulse wave amplitude; accel is the per-beat motion score, ALREADY "
-                "SHIFTED 20 s earlier to compensate for lag in the accel score, so plot pwa "
-                "and accel against rel_ms directly with no further correction. tier is beat "
-                "quality (T1 is clean). Plot pwa on top and accel beneath on a shared x-axis; "
-                "the amplitude envelope is the signal — sustained dips are the events, and a "
-                "quiet accel trace under them shows they are not movement.")
-    if md == "circadian_strips":
-        return ("Irregular-rhythm strips. Columns: recording_ts, strip_type (sinus/episode), "
-                "strip_id, rel_ms, ppg_green. Each strip_id is one ~30s strip; plot ppg_green "
-                "vs rel_ms. 'sinus' is the clean control rhythm; 'episode' strips are flagged "
-                "irregular-rhythm candidates.")
-    if md == "circadian_episodes":
-        return "Irregular-rhythm episode log: one row per detected episode (timing + duration)."
+                "accel, tier, algo_version. strip_id is <recording_ts>#strip — ONE "
+                "continuous 10-minute segment per recording, so no concatenation is "
+                "needed. Join to the sleep_pwr and sleep_pwr_episodes files on "
+                "recording_ts. rel_ms runs 0 to 600000. pwa is per-beat pulse wave "
+                "amplitude; accel is the per-beat motion score, exported as recorded and "
+                "already time-aligned to pwa — do not shift it. tier is beat quality (T1 "
+                "is clean). Plot pwa on top and accel beneath on a shared x-axis; "
+                "sustained suppression of amplitude is the signal, and a quiet accel "
+                "trace under it shows the suppression is not movement.")
     if md == "sleep_pwr":
         return ("Pulse Wave Rhythms summary: one row per recording. Columns: n_episodes, "
-                "episode_min_total (total minutes spent in episodes), drops_total, "
-                "strip_start, strip_mean_depth, algo_version. algo_version records the "
-                "detection thresholds that produced the row; rows with different "
-                "algo_version values are not directly comparable.")
+                "episode_min_total (total minutes spent in episodes), night_duty_pct, "
+                "strip_start, strip_duty_pct, algo_version. DUTY is the percentage of time "
+                "spent with pulse wave amplitude more than 70% below its running baseline; "
+                "night_duty_pct is that figure for the whole recording and is the best "
+                "night-to-night burden measure. algo_version records the settings that "
+                "produced the row; rows with different algo_version values are not "
+                "directly comparable.")
     if md == "sleep_pwr_episodes":
         return ("Pulse Wave Rhythms episode log: one row PER EPISODE, so a recording "
                 "contributes several rows. Columns: recording_ts, episode_id, start, end, "
-                "dur_min, mean_depth (mean pulse-wave-amplitude drop depth, 0-1), max_depth, "
-                "peak_score, algo_version (the detection thresholds behind the row; rows "
-                "with different algo_version values are not directly comparable). "
-                "Episodes are stretches where sustained amplitude drops recur; "
-                "they never overlap. Times are local with a UTC offset — keep them local. "
-                "These index arousals, which is why they can exceed what oximetry would "
-                "show; do not describe them as apnea, SDB, or a breathing diagnosis, and do "
-                "not treat depth or score as a severity measure.")
+                "dur_min, duty_mean_pct, duty_max_pct, algo_version. An episode is a "
+                "contiguous stretch where duty stays at or above 1%; episodes never "
+                "overlap. Times are local with a UTC offset — keep them local. Nothing "
+                "here counts discrete events: duty measures how much of the time amplitude "
+                "is suppressed, which is why there is no drop count or depth. These index "
+                "arousals, which is why they can exceed what oximetry would show; do not "
+                "describe them as apnea, SDB or a breathing diagnosis, and do not treat "
+                "duty as a severity measure.")
     return f"{md} session metrics: one row per recording."
 
 
