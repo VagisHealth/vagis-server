@@ -1649,19 +1649,17 @@ const CIRC_PRESETS = {
     "for the whole panel; those spikes run off the top and bottom, which is intended.",
     "The floor of 1000 stops an almost flat strip being blown up into pure noise.",
     "",
-    "Because the panels no longer share a scale, do not compare amplitude between",
-    "panels by eye and do not describe one strip as larger or smaller than another.",
-    "Compare beat spacing and beat-to-beat shape; read amplitude off the axis numbers.",
-    "",
     "Grid on at alpha 0.2. Draw nothing else: no markers, no shading, no vertical",
     "lines.",
     "",
-    "REPORT, for each strip, whether the beat-to-beat spacing looks regular or",
-    "irregular and whether beat amplitude varies. Compare each episode strip against",
-    "the sinus control from the same recording — that control is the same subject on",
-    "the same night, which is what makes the comparison meaningful.",
-    "If a recording has no sinus strip, say so; it means no gated, unflagged window",
-    "was available."
+    "OUTPUT THE FIGURE AND NOTHING ELSE. No commentary, no interpretation, no",
+    "description of the traces, no comparison between strips, no summary paragraph,",
+    "no caveats, no next steps. Do not say what the strips show. The researcher reads",
+    "the figure; if they want it interpreted they will ask, and you answer then.",
+    "",
+    "The only text permitted alongside the figure is a bare note naming any recording",
+    "in the selection that produced no sinus control strip, e.g. 'No sinus control",
+    "strip for 2026-07-24.' State it and stop; do not explain why."
   ].join("\n")
 };
 
