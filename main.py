@@ -1554,6 +1554,118 @@ const PWR_CONTEXT = [
   "algo_version matches the most recent recording's, and state which version that is."
 ].join("\n");
 
+const CIRC_CONTEXT = [
+  "BACKGROUND — read before analysing.",
+  "This is the irregular rhythm detector from circadian recordings. The recording is",
+  "cut into 30-second windows on a 15-second hop. Each window first passes a MOTION",
+  "GATE based on beat quality and movement; windows that fail are still logged, with",
+  "gate_pass 0 and the detector columns left blank, so the record is complete.",
+  "",
+  "A gated window is then judged on TWO independent axes, and both must agree before",
+  "it is flagged:",
+  "  calm_fraction        — how much of the window has settled beat-to-beat timing",
+  "  coupling_concordance — whether beat interval and pulse amplitude move together",
+  "confidence is the distance from the decision boundary, 0 to 1, not a probability.",
+  "Consecutive flagged windows are grouped into episodes.",
+  "",
+  "NAMING — call this irregular rhythm and nothing else, in text, table headers,",
+  "figure titles and axis labels, however the question is phrased. Never substitute a",
+  "named cardiac condition or its abbreviation, and never restate this instruction in",
+  "your answer.",
+  "",
+  "This flags a region for human review and would need ECG confirmation to mean",
+  "anything clinically. Do not describe it as detecting or diagnosing a condition, and",
+  "do not present confidence as a likelihood of disease.",
+  "",
+  "gated_pct is a data-quality figure, not a finding. A recording with a low gated_pct",
+  "had a lot of movement and its flagged counts mean less; say so when it is low.",
+  "",
+  "TIMESTAMPS — get this exactly right. Every timestamp column is ALREADY local clock",
+  "time, written with a trailing UTC offset such as 2026-07-27T22:40:15-07:00. Do NOT",
+  "use timezone conversion of any kind: no utc=True, no tz_convert, no tz_localize.",
+  "Take the first 19 characters of the string and parse that, e.g.",
+  "    pd.to_datetime(df['episode_start'].str.slice(0, 19))",
+  "That yields naive local time and cannot be shifted by anything. Verify one value",
+  "before you finish."
+].join("\n");
+
+const CIRC_PRESETS = {
+  circadian_rhythm: [
+    "TASK — irregular rhythm summary across recordings.",
+    "Use the circadian_rhythm file. One row per recording: total_windows,",
+    "gated_windows, gated_pct, flagged_windows, episode_count, flagged_minutes,",
+    "mean_calm_flagged, mean_coupling_flagged, mean_confidence, max_confidence,",
+    "sinus_available.",
+    "",
+    "TABLE every recording, ordered by date: recording_date, start_time,",
+    "duration_sec, gated_pct, flagged_windows, episode_count, flagged_minutes,",
+    "max_confidence.",
+    "",
+    "FIGURE — two stacked panels sharing a date x-axis, one pass, one figure:",
+    "  Top    — flagged_minutes per recording as bars",
+    "  Bottom — gated_pct per recording as a line, y-axis 0 to 100",
+    "The lower panel is there so a low flagged count on a poor-quality recording is",
+    "not read as a clean night. Label it 'Windows passing the motion gate (%)'.",
+    "",
+    "REPORT the range of flagged_minutes and episode_count across recordings, which",
+    "recordings carry the most, and whether gated_pct was adequate on those. With",
+    "fewer than three recordings say so and do not describe a trend."
+  ].join("\n"),
+
+  circadian_episodes: [
+    "TASK — irregular rhythm episodes.",
+    "Use the circadian_episodes file. One row per episode: recording_ts, episode_id,",
+    "episode_start, time_of_day_start, duration_min, n_windows, mean_calm_fraction,",
+    "mean_coupling_concordance, mean_confidence.",
+    "",
+    "TABLE every episode ordered by start: recording_date, episode_id, start as HH:MM,",
+    "duration_min, n_windows, mean_calm_fraction, mean_coupling_concordance,",
+    "mean_confidence. Finish with a total row: number of episodes and total minutes.",
+    "",
+    "FIGURE — two panels, one pass, one figure:",
+    "  Top    — each episode as a horizontal bar on a time-of-day x-axis (00:00 to",
+    "           24:00), one row per recording date, bar shaded by mean_confidence.",
+    "           This shows whether episodes cluster at a particular time of day.",
+    "  Bottom — scatter of mean_calm_fraction against mean_coupling_concordance, one",
+    "           point per episode, point size by duration_min. These are the two axes",
+    "           the detector uses; the scatter shows whether episodes were flagged on",
+    "           both or sat near the boundary on one.",
+    "",
+    "REPORT the number of episodes, total minutes, the longest, and where they fall in",
+    "the day. Say whether the episodes cluster on the two axes or spread out."
+  ].join("\n"),
+
+  circadian_strips: [
+    "TASK — irregular rhythm strips, episode against sinus control.",
+    "Use the circadian_strips file: recording_ts, strip_type, strip_id, rel_ms,",
+    "ppg_green. strip_type is either sinus or episode. Each strip is a 30-second clip",
+    "of raw green PPG at 25 Hz; rel_ms restarts at 0 within each strip. Every",
+    "recording contributes one sinus control strip and one strip per episode.",
+    "",
+    "PREPARE THE SIGNAL — the samples are raw and unusable as they arrive:",
+    "  1. INVERT (multiply by -1). The sensor value falls as blood volume rises, so",
+    "     without this every pulse points downward.",
+    "  2. High-pass at 0.5 Hz to remove baseline wander — a 2nd-order Butterworth,",
+    "     applied forwards and backwards so the beats are not shifted in time.",
+    "Do this before plotting anything. Do not smooth further; the beat-to-beat shape",
+    "is the whole point.",
+    "",
+    "FIGURE — one panel per strip, stacked in a single figure, sinus control FIRST",
+    "then each episode strip in time order. All panels share one y-scale so the",
+    "traces compare directly, and each x-axis runs 0 to 30 seconds. Label every panel",
+    "with its strip_type and strip_id. Y label 'PPG (filtered)', x label",
+    "'Seconds within strip'. Build it in one pass with a single subplots call.",
+    "Draw nothing else: no markers, no shading, no vertical lines.",
+    "",
+    "REPORT, for each strip, whether the beat-to-beat spacing looks regular or",
+    "irregular and whether beat amplitude varies. Compare each episode strip against",
+    "the sinus control from the same recording — that control is the same subject on",
+    "the same night, which is what makes the comparison meaningful.",
+    "If a recording has no sinus strip, say so; it means no gated, unflagged window",
+    "was available."
+  ].join("\n")
+};
+
 const PWR_PRESETS = {
   sleep_pwr_strips: [
     "TASK — Pulse Wave Rhythms strips, disturbance against control.",
@@ -1656,7 +1768,8 @@ function buildPrompt() {
   const mode = pModeEl.value;
   const box = document.getElementById('input');
   if (!mode) { box.value = "Choose a Mode first."; box.focus(); return; }
-  const preset = PWR_PRESETS[mode];
+  const isCirc = (CIRC_PRESETS[mode] !== undefined);
+  const preset = isCirc ? CIRC_PRESETS[mode] : PWR_PRESETS[mode];
   if (!preset) {
     box.value = "No preset is written for this mode yet — type your request instead.";
     box.focus(); return;
@@ -1667,7 +1780,7 @@ function buildPrompt() {
   if (dl) parts.push(dl);
   if (metric && metric !== 'all') parts.push("FOCUS on the metric: " + metric + ".");
   const tableOnly = (mode === 'sleep_pwr' || mode === 'sleep_pwr_episodes');
-  parts.push("", PWR_CONTEXT, "",
+  parts.push("", isCirc ? CIRC_CONTEXT : PWR_CONTEXT, "",
              tableOnly ? "One code execution. Table only — no figure."
                        : "One code execution, one figure.");
   box.value = parts.join("\n");
