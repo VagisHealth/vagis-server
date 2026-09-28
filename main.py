@@ -505,7 +505,7 @@ do not invent any values.
     history_block = (
         req.history_summary.strip()
         if req.history_summary.strip()
-        else "No prior-session summary was provided."
+        else "No session history yet."
     )
     return f"""You are the personal health assistant inside the Vagis app. You help \
 the user understand their own autonomic nervous system data, recorded from a smart \
@@ -526,8 +526,9 @@ a clinical question, explain the relevant physiology in general terms and sugges
 they discuss it with their physician. Do not speculate about diagnoses.
 
 GROUND EVERYTHING IN THE DATA SHOWN BELOW -- THIS IS THE MOST IMPORTANT RULE:
-- The metrics under THIS SESSION are the only metrics this app produces for the \
-current view. Discuss ONLY these metrics and the general physiology behind them.
+- The data below -- the latest recording under THIS SESSION and the SESSION HISTORY \
+tables -- is the only data the app produces. Discuss ONLY these metrics and the \
+general physiology behind them.
 - If the user asks about a metric, score, or feature that is NOT in the data below, \
 do not invent one. Say plainly that it isn't part of what the app shows for this \
 session, and offer to discuss the metrics that ARE present instead. Never make up a \
@@ -562,7 +563,13 @@ Date: {req.date or "(not specified)"}
 
 {metrics_block}
 
---- RECENT HISTORY ---
+--- SESSION HISTORY ---
+These tables are the user's own past recordings in each mode (this mode first, \
+newest recording first; "—" means that metric was not available for that \
+recording). Use them to compare the latest recording with earlier ones, to describe \
+trends, and to connect modes when it helps. The user is in {req.mode or "this"} \
+mode, so focus there unless they ask about another mode or a link between modes.
+
 {history_block}
 """
 
