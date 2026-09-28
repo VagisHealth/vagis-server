@@ -380,8 +380,46 @@ def render_metrics(metrics: dict[str, dict[str, Any]]) -> str:
     return "\n".join(lines).strip()
 
 
+# Plain-language description of each app mode's metrics, so the agent can
+# explain a mode even before the user has recorded in it. Only what the app
+# actually shows -- no formulas or cut-offs. Modes not listed here rely on the
+# session data alone, as before.
+MODE_GUIDES: dict[str, str] = {
+    "Load": """Load is a daytime monitor built from two things the ring measures: heart \
+rate and hand movement (accelerometer). Movement is the foundation -- it decides \
+which moments were still and which were active, and heart rate is read against it. \
+Load does not use pulse amplitude.
+Metrics the app shows:
+- Timeline: heart rate and movement across the whole recording; lowest, average and \
+maximum heart rate.
+- Motion: how the recording divided between four movement bands -- Still, Light, \
+Moderate and High -- as a share of the recording and as time.
+- Response: the typical (median) heart rate in each movement band, and the Still to \
+High difference (heart rate in High movement minus heart rate while Still), i.e. how \
+much the heart rate rises with activity. Heart rate follows movement with a short \
+delay, so each stretch is assigned to a band by the movement just before it.
+- Heart rate ceiling: a level set from the user's age (only if they entered one), \
+and the minutes spent above it.
+Load is a monitor, not a test: it does not score a recording or say what is good or \
+bad. Changes over days and weeks are for the user to interpret, and comparing a \
+recording with their own recent ones is more meaningful than any single value. \
+It is aimed at people tracking day-to-day energy limits (e.g. ME/CFS, long COVID).""",
+}
+
+
 def build_system_prompt(req: ChatRequest) -> str:
     metrics_block = render_metrics(req.metrics)
+    guide = MODE_GUIDES.get(req.mode.strip(), "")
+    guide_block = (
+        f"""
+--- ABOUT THIS MODE ---
+{guide}
+If no session data is shown below, the user has not recorded in this mode yet: \
+explain what the mode and its metrics are, using only the description above, and \
+do not invent any values.
+"""
+        if guide else ""
+    )
     history_block = (
         req.history_summary.strip()
         if req.history_summary.strip()
@@ -435,6 +473,7 @@ How to respond:
 - Only discuss the data and physiology. If asked something unrelated, gently steer \
 back to their health data.
 
+{guide_block}
 --- THIS SESSION ---
 Mode: {req.mode or "(not specified)"}
 Date: {req.date or "(not specified)"}
