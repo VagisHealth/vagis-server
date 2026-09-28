@@ -413,12 +413,17 @@ Load does not use pulse amplitude.
 Metrics the app shows:
 - Timeline: heart rate and movement across the whole recording; lowest, average and \
 maximum heart rate.
-- Motion: how the recording divided between four movement bands -- Still, Light, \
-Moderate and High -- as a share of the recording and as time.
-- Response: the typical (median) heart rate in each movement band, and the Still to \
-High difference (heart rate in High movement minus heart rate while Still), i.e. how \
-much the heart rate rises with activity. Heart rate follows movement with a short \
-delay, so each stretch is assigned to a band by the movement just before it.
+- Motion: bars show how the recording divided between four movement bands -- Still, \
+Light, Moderate and High. Tiles: longest still stretch (longest unbroken rest), \
+moving bouts per hour (stretches of moderate or high movement lasting a minute or \
+more), longest moving bout, and average motion (overall movement intensity, in g).
+- Response: bars show the typical (median) heart rate in each movement band. Heart \
+rate follows movement with a short delay, so each stretch is assigned to a band by \
+the movement just before it. Tiles: Still to High difference (how much heart rate \
+rises from still to high movement), heart rate per motion (how much heart rate rises \
+for a given amount of movement -- the heart-rate cost of moving), response delay \
+(how many seconds heart rate takes to follow movement), and still heart rate range \
+(how settled heart rate is while still; a wide range means it is unsettled at rest).
 - Heart rate ceiling: a level set from the user's age (only if they entered one), \
 and the minutes spent above it.
 Load is a monitor, not a test: it does not score a recording or say what is good or \
