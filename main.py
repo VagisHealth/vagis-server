@@ -52,6 +52,15 @@ MODEL = os.environ.get("VAGIS_MODEL", "claude-sonnet-4-6")
 MAX_TOKENS = int(os.environ.get("VAGIS_MAX_TOKENS", "1024"))
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
+# Per-phone question caps for the in-app agent. Each phone sends an anonymous
+# ID (X-Vagis-Device); questions are counted per ID per UTC day. Set a cap to
+# 0 to switch it off. Exempt IDs (comma-separated) are never capped.
+AGENT_DAILY_CAP = int(os.environ.get("VAGIS_AGENT_DAILY_CAP", "20"))
+AGENT_MONTHLY_CAP = int(os.environ.get("VAGIS_AGENT_MONTHLY_CAP", "200"))
+AGENT_EXEMPT_DEVICES = {
+    d.strip() for d in os.environ.get("VAGIS_AGENT_EXEMPT_DEVICES", "").split(",") if d.strip()
+}
+
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 # Clinical (PT) uploads self-delete this many hours after they arrive.
@@ -228,6 +237,17 @@ RETURNING uploaded_at, expires_at;
 """
 
 
+# agent_usage: questions asked per phone per UTC day, for the per-phone caps.
+CREATE_AGENT_USAGE_SQL = """
+CREATE TABLE IF NOT EXISTS agent_usage (
+    device_id  TEXT NOT NULL,
+    day        DATE NOT NULL,
+    questions  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (device_id, day)
+);
+"""
+
+
 def db_connect():
     if not DATABASE_URL:
         raise HTTPException(status_code=500, detail="Database not configured.")
@@ -242,6 +262,7 @@ def ensure_tables(cur) -> None:
     cur.execute(CREATE_PERSONS_SQL)
     cur.execute(CREATE_RESEARCH_UPLOADS_SQL)
     cur.execute(CREATE_CLINICAL_HOLDS_SQL)
+    cur.execute(CREATE_AGENT_USAGE_SQL)
     # Cache of the Anthropic Files API id for each stored CSV, so the analysis
     # agent reads data off disk in its sandbox instead of having it inlined in
     # the prompt. Re-uploaded only when the underlying CSV is newer.
@@ -404,6 +425,67 @@ Load is a monitor, not a test: it does not score a recording or say what is good
 bad. Changes over days and weeks are for the user to interpret, and comparing a \
 recording with their own recent ones is more meaningful than any single value. \
 It is aimed at people tracking day-to-day energy limits (e.g. ME/CFS, long COVID).""",
+
+    "Sleep": """Sleep records a whole night from the ring: heart beats, pulse wave and \
+movement. Tabs: Stages, Heart Rate, Breath, Cycling, Deep, Export.
+- Stages: the night divided into Awake, REM, Light and Deep sleep, estimated from \
+heart-rhythm patterns and movement. Ring-based staging is an estimate, not a sleep-lab \
+study.
+- Heart Rate: heart rate across the night.
+- ADI (Autonomic Disturbance Index): how much slow, disturbance-type fluctuation there \
+is in the heart rhythm across the night -- a general marker of how settled the \
+nervous system was.
+- Breath: breathing-related measures from the ring signals.
+- Cycling: slow rises and falls in the pulse wave (the finger's blood-flow signal). \
+Three kinds are shown: Vasocycling (the normal resting rhythm of the blood vessels, \
+no bigger than the user's own Deep-sleep cycling), PWA Cycling (bigger cycling while \
+the breathing movement in the pulse is reduced), and PWA Cycling + HR (the same with \
+a heart-rate surge well beyond the user's own Deep-sleep swing). These are measured \
+patterns, not a diagnosis; oxygen dips are not required for them to appear.
+- Deep: measures taken only from Deep sleep, the calmest and most restorative stage, \
+used as the user's own calm reference.
+Sleep is a monitor, not a diagnostic test. Nightly values vary; trends across nights \
+are more meaningful than a single night.""",
+
+    "Stand": """Stand is an active stand test: the user lies or sits still, then \
+stands, while the ring records. It shows how the heart and blood vessels respond to \
+standing up.
+- Heart Rate: resting heart rate, peak standing heart rate, the rise from rest to \
+standing, how fast it rose and when it peaked, the rises at 1 and 2 minutes, and any \
+recovery dip after the peak. All heart-rate values come from the ring's own heart-rate \
+reading.
+- Pulse Strength: how the size of the pulse at the finger changes on standing.
+- Rise Timing: how quickly each pulse rises, relative to the heartbeat, before and \
+after standing.
+- Blood Pooling: signs of blood shifting into the lower body on standing.
+- The app notes whether the heart-rate rise meets a widely used orthostatic \
+criterion. That is a measured result, not a diagnosis of POTS or any condition -- only \
+a clinician can diagnose.
+Repeating the test under similar conditions and comparing results over time is more \
+meaningful than one test.""",
+
+    "Exertion": """Exertion tracks heart rate through daily activity. The ring can \
+store heart rate while the phone is away and hand it over when it reconnects, so a \
+recording can cover a whole day. Using the age and weight the user entered, it \
+estimates how hard the body was working.
+Metrics: resting heart rate, typical (median), high (95th percentile) and peak heart \
+rate, heart rate as a share of estimated maximum, estimated METs (effort relative to \
+rest), and energy rate (kcal per hour).
+METs, maximum heart rate and energy values are population-based estimates, not \
+measurements. Exertion is a monitor, not a medical test: it does not detect or predict \
+post-exertional malaise. It is aimed at people pacing their energy (e.g. ME/CFS, long \
+COVID, hEDS); comparing days with the user's own history is the useful part.""",
+
+    "Breathwork": """Breathwork guides the user through slow, paced breathing (or free \
+breathing) while the ring records, and shows how strongly the heart and blood vessels \
+follow the breath.
+Metrics: breathing pace (breaths per minute), RSA amplitude (how much the heart rate \
+rises and falls with each breath -- larger usually means stronger breathing-linked \
+heart-rhythm activity), coherence (how closely the heart rhythm and the pulse wave \
+move together with the breath), ln LF (slow heart-rhythm power, which paced breathing \
+around six breaths per minute tends to boost), and pulse-wave variability.
+Breathwork is a practice and a monitor, not a treatment or test. Values change with \
+pace, posture and practice; comparing sessions at the same pace is most meaningful.""",
 }
 
 
@@ -500,16 +582,96 @@ def health() -> dict[str, Any]:
         "admin_token_set": bool(VAGIS_ADMIN_TOKEN),
         "database_url_set": bool(DATABASE_URL),
         "clinical_hold_hours": CLINICAL_HOLD_HOURS,
+        "agent_daily_cap": AGENT_DAILY_CAP,
+        "agent_monthly_cap": AGENT_MONTHLY_CAP,
+        "agent_exempt_devices": len(AGENT_EXEMPT_DEVICES),
     }
 
 
+# --------------------------------------------------------------------------
+# Per-phone question caps
+# --------------------------------------------------------------------------
+# FAIL OPEN: if the database cannot be reached, the question is answered and
+# simply not counted. A database hiccup must never take the agent down.
+def _agent_usage(device_id: str) -> Optional[tuple[int, int]]:
+    """(questions today, questions this month) for one phone, UTC."""
+    if not DATABASE_URL:
+        return None
+    today = datetime.now(timezone.utc).date()
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn, conn.cursor() as cur:
+            cur.execute(CREATE_AGENT_USAGE_SQL)
+            cur.execute(
+                "SELECT COALESCE(SUM(questions) FILTER (WHERE day = %s), 0), "
+                "COALESCE(SUM(questions), 0) FROM agent_usage "
+                "WHERE device_id = %s AND day >= %s;",
+                (today, device_id, today.replace(day=1)),
+            )
+            row = cur.fetchone()
+        conn.close()
+        return int(row[0]), int(row[1])
+    except Exception as e:
+        print(f"[agent-cap] usage read failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _agent_record(device_id: str) -> None:
+    if not DATABASE_URL:
+        return
+    today = datetime.now(timezone.utc).date()
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO agent_usage (device_id, day, questions) VALUES (%s, %s, 1) "
+                "ON CONFLICT (device_id, day) DO UPDATE "
+                "SET questions = agent_usage.questions + 1;",
+                (device_id, today),
+            )
+        conn.close()
+    except Exception as e:
+        print(f"[agent-cap] usage write failed: {type(e).__name__}: {e}")
+
+
+def _check_agent_cap(device_id: str) -> None:
+    """Raise 429 with a message the app shows as-is when a cap is reached."""
+    counts = _agent_usage(device_id)
+    if counts is None:
+        return
+    today_n, month_n = counts
+    if AGENT_DAILY_CAP > 0 and today_n >= AGENT_DAILY_CAP:
+        now = datetime.now(timezone.utc)
+        midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        hours = max(1, round((midnight - now).total_seconds() / 3600))
+        raise HTTPException(
+            status_code=429,
+            detail=(f"You've reached today's limit of {AGENT_DAILY_CAP} questions. "
+                    f"It resets in about {hours} hour{'s' if hours != 1 else ''}."),
+        )
+    if AGENT_MONTHLY_CAP > 0 and month_n >= AGENT_MONTHLY_CAP:
+        raise HTTPException(
+            status_code=429,
+            detail=(f"You've reached this month's limit of {AGENT_MONTHLY_CAP} questions. "
+                    "It resets on the 1st of next month."),
+        )
+
+
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest, authorization: str | None = Header(default=None)) -> ChatResponse:
+def chat(req: ChatRequest, authorization: str | None = Header(default=None),
+         x_vagis_device: str | None = Header(default=None)) -> ChatResponse:
     check_app_auth(authorization)
     if not ANTHROPIC_API_KEY:
         raise HTTPException(status_code=500, detail="Anthropic key not configured.")
     if not req.conversation:
         raise HTTPException(status_code=400, detail="No conversation provided.")
+
+    # Older app builds send no device ID; they are not capped (they will be
+    # replaced by the next TestFlight build).
+    device_id = (x_vagis_device or "").strip()[:64]
+    capped = bool(device_id) and device_id not in AGENT_EXEMPT_DEVICES
+    if capped:
+        _check_agent_cap(device_id)
 
     system_prompt = build_system_prompt(req)
     messages = [{"role": t.role, "content": t.content} for t in req.conversation]
@@ -532,6 +694,9 @@ def chat(req: ChatRequest, authorization: str | None = Header(default=None)) -> 
     if not reply:
         raise HTTPException(status_code=502, detail="Empty reply from model.")
 
+    # Counted only once answered, so a failed call never uses up a question.
+    if device_id:
+        _agent_record(device_id)
     return ChatResponse(reply=reply)
 
 
