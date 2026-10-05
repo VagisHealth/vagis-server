@@ -943,7 +943,9 @@ def _mode_label(m: str) -> str:
             "circadian": "Circadian", "circadian_rhythm": "Circadian Rhythm",
             "circadian_episodes": "Circadian Episodes",
             "sleep_pwr": "Pulse Wave Rhythms",
-            "sleep_pwr_episodes": "Pulse Wave Rhythms Episodes"}.get(m, m.capitalize())
+            "sleep_pwr_episodes": "Pulse Wave Rhythms Episodes",
+            "exertion": "Exertion", "load": "Load",
+            "quick_check": "Quick Check"}.get(m, m.capitalize())
 
 
 # ---- Admin page ----------------------------------------------------------
@@ -970,6 +972,17 @@ def _admin_page(token: str = "", banner: str = "") -> str:
       <label>Provider email (required)</label>
       <input name="email" type="text" placeholder="jane@example.com">
       <button type="submit">Create provider</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2>AI Connect key</h2>
+    <p class="sub">Make a private connector address so a person's Claude or ChatGPT can read their Session History.</p>
+    <form method="post" action="/admin/ui/aiconnect">
+      <label>Admin token</label>
+      <input name="token" type="password" placeholder="Your VAGIS_ADMIN_TOKEN" value="{tok}" autocomplete="off">
+      <label>Person code (SE)</label>
+      <input name="person_code" type="text" placeholder="SE0010001K3P">
+      <button type="submit">Make connector address</button>
     </form>
   </div>
   <div class="card">
@@ -2850,3 +2863,711 @@ def _build_summary_pdf(title: str, text: str, images: list[bytes]) -> bytes:
 
     c.showPage(); c.save()
     return buf.getvalue()
+
+
+# ==========================================================================
+# AI CONNECT — the Vagis connector for Claude, ChatGPT and other chat agents
+# ==========================================================================
+# A Model Context Protocol (MCP) server over plain HTTP, built into this app.
+#
+# HOW A USER CONNECTS (testing stage)
+#   1. Admin page -> "AI Connect key": enter the person's SE code. The server
+#      makes a private connector address:
+#          https://vagis-server.onrender.com/mcp/<private key>
+#   2. In Claude: Customize > Connectors > + > Add custom connector, paste
+#      that address, name it Vagis.
+#   3. The agent can now read that person's Session History and the guide.
+#
+# The private key in the address is the login for now. Anyone with the
+# address can read that person's metrics, so it is treated like a password.
+# Making a new key for the same person retires the old one. A proper login
+# (OAuth) replaces this before public release.
+#
+# WHAT THE AGENT CAN DO (tools)
+#   get_vagis_guide      the overview, rules and mode guides (GUIDE_TEXT below)
+#   list_my_data         which modes have Session History on the server
+#   get_session_history  one mode's Session History (CSV, one row per recording)
+#   save_note / get_notes  short notes carried between conversations
+#
+# Only Session History metrics (what the app uploads via Data Share) are ever
+# served. No raw signal exists on the server.
+#
+# ADAPTS TO APP CHANGES. Session History is served exactly as uploaded, with
+# whatever columns it has, and any mode name the app sends is listed. New or
+# renamed metrics and new modes need no change here — only the guide text.
+# --------------------------------------------------------------------------
+import json as _json
+from pathlib import Path as _Path
+
+from fastapi import Request
+from fastapi.responses import JSONResponse, Response
+
+GUIDE_DIR = _Path(__file__).parent / "guide"
+GUIDE_SECTIONS = {
+    "overview":         "00_overview_and_rules",
+    "sleep":            "sleep",
+    "stand":            "stand",
+    "exertion":         "exertion",
+    "load":             "load",
+    "breathwork":       "breathwork",
+    "quick_check":      "quick_check",
+    "load_and_reserve": "load_and_reserve",
+    "background_data":  "background_data",
+}
+MCP_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+AI_NOTE_MAX_CHARS = 4000
+AI_NOTES_RETURNED = 30
+
+CREATE_AI_KEYS_SQL = """
+CREATE TABLE IF NOT EXISTS ai_connect_keys (
+    key          TEXT PRIMARY KEY,
+    person_code  TEXT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked      BOOLEAN NOT NULL DEFAULT FALSE
+);
+"""
+
+CREATE_AI_NOTES_SQL = """
+CREATE TABLE IF NOT EXISTS ai_notes (
+    id           SERIAL PRIMARY KEY,
+    person_code  TEXT NOT NULL,
+    note         TEXT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+
+def _ai_ensure_tables(cur) -> None:
+    ensure_tables(cur)
+    cur.execute(CREATE_AI_KEYS_SQL)
+    cur.execute(CREATE_AI_NOTES_SQL)
+
+
+# ---- Keys ----------------------------------------------------------------
+def _ai_issue_key(cur, person_code: str) -> str:
+    """New private key for a person; any earlier key stops working."""
+    cur.execute("UPDATE ai_connect_keys SET revoked = TRUE WHERE person_code = %s;",
+                (person_code,))
+    key = secrets.token_urlsafe(24)
+    cur.execute("INSERT INTO ai_connect_keys (key, person_code) VALUES (%s, %s);",
+                (key, person_code))
+    return key
+
+
+def _ai_person_for_key(key: str) -> Optional[str]:
+    if not key or not DATABASE_URL:
+        return None
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _ai_ensure_tables(cur)
+            cur.execute("SELECT person_code FROM ai_connect_keys "
+                        "WHERE key = %s AND NOT revoked;", (key,))
+            row = cur.fetchone()
+            return row[0] if row else None
+    finally:
+        conn.close()
+
+
+# ---- Tools ---------------------------------------------------------------
+# The Vagis guide. Built in here so main.py is the only file to update.
+# A guide/<name>.md file next to main.py, if present, takes priority.
+GUIDE_TEXT: dict[str, str] = {
+    "overview": r"""# Vagis Guide — Overview and Rules
+
+## What Vagis is
+Vagis Health is an iPhone app that works with the 2301B smart ring. The ring measures the pulse at the finger with light (PPG) and records movement with an accelerometer. The app turns those signals into metrics about heart rate, heart rate variability, the pulse wave and movement.
+
+The app has three homepage sections:
+- **Sessions** — recording modes: Sleep, Stand, Exertion, Load, Breathwork, Quick Check.
+- **Analysis** — views that combine modes: Load & Reserve, Data Share, AI Connect.
+- **Background** — information the user adds: Genomics, Questionnaires, Calendar.
+
+Each recording mode has its own guide file. Every mode keeps a **Session History**: one row of metrics per recording, newest first. Session History is the only recording data you receive. Raw signals never leave the phone.
+
+## Who uses Vagis
+Many users live with ME/CFS, Long COVID, hEDS or other conditions that affect the autonomic nervous system. A recording may be a hard effort or a housebound person doing very little; both are equally valid.
+
+## Rules for answering
+1. **Research use only.** Vagis metrics are not diagnostic measurements. Never diagnose, and never state that a user has or does not have a condition. Suggest discussing notable findings with their clinician.
+2. **Label by what was measured.** Use the metric names exactly as the app shows them. Do not add severity words (mild, moderate, severe, abnormal, normal) and do not convert Vagis metrics into clinical scores such as AHI, RDI or blood pressure.
+3. **Compare the user with themselves.** The most useful comparison is against the user's own earlier recordings of the same mode, taken the same way. Avoid population "normal ranges" unless the user asks, and say they are general.
+4. **Do not explain how metrics are calculated.** Describe what a metric means and what it reflects, never its formula, thresholds or algorithm. Some methods are protected (for example Vascular Tone). If asked, say the method is proprietary.
+5. **Do not grade effort or recovery.** Never praise higher numbers or treat lower ones as underperformance, and do not predict crashes, flares or post-exertional malaise.
+6. **Frequency language.** Describe rhythms by frequency in Hz or by the named band (for example "Neurogenic band, 0.021–0.052 Hz"), not as cycle length in seconds.
+7. **Be plain and specific.** Use the user's actual numbers and dates. Keep answers short unless more detail is asked for.
+
+## Data you may receive
+- Session History for each recording mode.
+- Saved genomic variants (selected variants only; the full genome file never leaves the phone).
+- Questionnaire answers and calendar notes.
+- Lab and test results the user chose to save (values and dates only).
+- Notes saved from earlier conversations.
+""",
+    "sleep": r"""# Vagis Guide — Sleep
+
+## How to use it
+1. Open Sleep and tap Start before bed, with the ring on and connected.
+2. Sleep normally. The phone can stay nearby; the recording resumes on its own if the connection drops.
+3. Tap Stop in the morning. Analysis needs at least 2 hours of recording and takes 1–2 minutes.
+
+Sleep uses the ring's red/infrared light. Stopping a recording analyses that night only; earlier nights are read from Session History.
+
+## Tabs and graphs
+- **Stages** — a hypnogram of Awake, REM, Light and Deep sleep across the night, with a motion strip underneath. Stages come from heart rate, pulse and movement, not brain waves, so they are an estimate.
+- **Heart Rate** — heart rate across the night with movement underneath.
+- **Cycling** — "Pulse Wave Cycling": overlapping curves showing how many cycling episodes occurred in each 5 minutes of the night. Blue is PWA Cycling, dark red is PWA-HR Cycling.
+- **Deep** — two traces from a 5-minute stretch of Deep sleep: the time between beats (RR interval, blue) above the pulse wave amplitude (PWA, orange).
+- **Bands** — a bar for each vascular rhythm band, measured on a 30-minute stretch of non-REM sleep (at least 20 minutes of it light, no REM or waking). Each bar is how much pulse size swings in that band, as a percentage of its own mean. Bands: Endothelial 0.005–0.0095 Hz, Endothelial-NO 0.0095–0.021 Hz, Neurogenic 0.021–0.052 Hz, Myogenic 0.052–0.145 Hz.
+- **Export** — CSV files for each recording and the cumulative metrics file.
+
+## Key terms
+- **PWA (pulse wave amplitude)** — the size of each pulse at the finger. It shrinks when finger vessels tighten and grows when they relax.
+- **Deep sleep as the reference** — Deep sleep is the calmest part of the night, so several metrics use the user's own Deep sleep as their personal baseline.
+
+## Session History metrics
+### Stages
+- **Sleep Time** (hours) — time asleep.
+- **Deep %** and **REM %** — share of the recording in Deep and REM sleep.
+- **Deep Sleep Time** and **REM Sleep Time** (min).
+- **Autonomic Disturbance Index (ADI)** (%) — how much of the night's heart rate variability sits in the slowest rhythms. Higher means more slow autonomic disturbance across the night.
+- **Breathing Rate** (breaths/min) — average overnight breathing rate.
+- **Δ Temp** (°C) — change in skin temperature measured by the ring. Ring temperature is noisy, so treat small changes with caution.
+- **Motion per Hour** — movements per hour of recording.
+
+### Heart Rate
+- **Average Heart Rate** (bpm).
+- **Sustained Nadir** and **Sustained Peak** (bpm) — the lowest and highest heart rate held for a sustained stretch, not single beats.
+- **SDNN** (ms) — overall heart rate variability across the night.
+- **RMSSD** (ms) — beat-to-beat variability, mainly reflecting vagal (rest-and-digest) activity.
+- **Overnight HR Dip** (%) — how far heart rate falls during the night.
+
+### Cycling
+Slow, repeating rises and falls in pulse size during sleep fall into three groups:
+- **Vaso-cycling** — cycling within the depth the user shows in their own Deep sleep; their own normal vessel rhythm.
+- **PWA Cycling** — cycling deeper than the user's own Deep sleep range, without a heart-rate surge.
+- **PWA-HR Cycling** — cycling with a heart-rate surge at the same time.
+
+Each group is reported per hour of sleep and as total minutes. **Total Obstruction (PWA + PWA-HR)** is PWA Cycling plus PWA-HR Cycling per hour of sleep.
+
+These are measured pulse-wave patterns. Breathing disruption can occur without a fall in oxygen, so these patterns are not expected to match oximetry. Do not call them apneas or convert them to AHI.
+
+### Deep
+Measured on the user's Deep sleep:
+- **Deep HR Swing** (bpm) — typical size of heart-rate swings in Deep sleep; the user's calm-state reactivity.
+- **Deep SDNN** and **Deep RMSSD** (ms) — heart rate variability in Deep sleep.
+- **Pulse Wave Variability** (%) — how much pulse size varies in Deep sleep.
+- **Vasomotor Power** — strength of slow vessel-tone rhythms in pulse size during Deep sleep.
+- **Respiratory DC Modulation** (% of DC) — how much the finger's blood volume level moves with each breath.
+- **Perfusion Index** (% of DC) — how strongly blood pulses into the finger relative to its steady level.
+
+## Notes for interpretation
+- The app does not measure lymphatic or glymphatic clearance; do not claim it does.
+- Compare nights against the user's own earlier nights.
+""",
+    "stand": r"""# Vagis Guide — Stand
+
+## How to use it
+Choose a test mode first: **Short** or **Long**.
+1. **Lie down, 90 s.** Stay still and breathe normally. The ring settles over the first 20 s.
+2. **Stand on the cue.** A spoken countdown plays; stand and stay still with your arm at your side.
+3. **Stand.** Short test: 75 s, and the test ends there. Long test: 2.5 min. Standing still matters more than standing straight.
+4. **Long test only — lie down on the cue.** Stay down for the last 2.5 min so recovery is recorded.
+
+Phases: **Supine 1** (lying before standing), **Standing**, and **Supine 2** (lying after, long test only). Every heart rate value comes from the ring's own heart rate.
+
+## Tabs and graphs
+- **HR** — heart rate through the test. "HR Rise While Standing" shows the rise above lying heart rate with a +30 bpm reference line used in research criteria. Research only, not a diagnosis.
+- **Pulse** — "Pulse Amplitude & Venous Pooling": two stacked dot panels sharing the phase axis, pulse amplitude above venous pooling, with the change shown between phases.
+- **Waveform** — "Pulse Shape": the average pulse shape for each phase, in ms from the pulse foot, with Time to Peak tiles per phase.
+- **Export** — CSV files and the metrics master.
+
+## Key terms
+- **Pulse Strength / Pulse Amplitude** — height of each pulse, adjusted for light reaching the sensor. It usually falls on standing as finger vessels tighten.
+- **Rise Timing** — share of each beat spent rising to the pulse peak.
+- **Blood Pooling / Venous Pooling** — blood sitting in the finger, with lying down = 100.
+
+## Session History metrics
+### Heart Rate
+- **Supine Heart Rate** (bpm) — lying heart rate before standing.
+- **Peak Standing Heart Rate** (bpm).
+- **Change on Standing** (bpm) — standing heart rate minus lying heart rate.
+- **Rise at 1 Minute** and **Rise at 2 Minutes** (bpm) — heart rate rise above lying at those times.
+- **Heart Rate After Lying Back Down** (bpm) — long test.
+- **Recovery Dip** (bpm) — how far heart rate dips after lying back down (long test).
+
+### Pulse
+- **Pulse Amplitude — Supine 1 / Standing / Supine 2** (counts).
+- **Pulse Amplitude — Supine 1 to Standing** and **— Standing to Supine 2** (% of supine) — change between phases.
+- **Venous Pooling — Supine 1 to Standing** and **— Standing to Supine 2** (index points) — change in blood sitting in the finger.
+
+### Waveform
+- **Rise Timing — Supine 1 / Standing / Supine 2** (% of beat), and the change between phases (points).
+- **Time to Peak — Supine 1 / Standing / Supine 2** (ms) — time from the start of the pulse to its peak.
+
+## Notes for interpretation
+- Short and long tests are only comparable with tests of the same mode.
+- Do not diagnose POTS or any condition; describe the measured rise and suggest the user discuss it with their clinician if it concerns them.
+""",
+    "exertion": r"""# Vagis Guide — Exertion
+
+## How to use it
+1. Enter age, sex and weight once. They stay on the phone and are never uploaded. Sex only selects the right VO2max equation.
+2. Tap Start. The ring stores heart rate on its own, so the phone is not needed during the recording.
+3. Go about the activity or the day. Record at least 30 minutes; under an hour, peak values may not represent the day.
+4. Tap Finish to download the heart rate from the ring and analyse it.
+
+Resting heart rate comes from the user's Quick Check if they did one in the last 14 days. Otherwise it is estimated from the recording itself, and the app shows a note saying so.
+
+Exertion is a **monitor**, not a fitness test and not a diagnostic. It describes what the heart did.
+
+## Tabs and graphs
+- **HR** — heart rate across the recording with the resting level marked, plus time spent in heart-rate ranges.
+- **Energy** — estimated METs and energy use across the recording.
+- **Export** — the metrics workbook (one row per session) and the 5-second heart rate samples.
+
+## Session History metrics
+### Heart rate
+- **Time** (min) — recording length.
+- **Resting Heart Rate** (bpm) — from Quick Check, or estimated from the recording.
+- **Average Heart Rate** and **Median Heart Rate** (bpm).
+- **Peak Heart Rate** (bpm) — highest heart rate in the recording.
+- **Heart Rate Range** (bpm).
+- **Time Above Rest** (%) — share of the recording above resting heart rate.
+
+### Demand
+- **Maximum Heart Rate** (bpm) — the highest heart rate actually recorded.
+- **Heart Rate Reserve** (bpm) — maximum minus resting heart rate.
+- **Resting % of Max**, **Mean % of Max**, **Peak % of Max** (%) — heart rate as a share of maximum.
+- **VO2max** (mL/kg/min) — an estimate of aerobic capacity from maximum and resting heart rate. It updates as those values change.
+
+### Energy
+- **Mean METs** and **Peak METs** — estimated energy cost relative to rest.
+- **Energy Rate** (kcal/h), **Energy Above Rest** (kcal/h), **Total Energy** (kcal).
+
+## Notes for interpretation
+- METs, calories and VO2max are estimates that assume typical physiology. In people whose heart rate does not rise normally with activity, they can be off.
+- The ring's stored heart rate is smoothed, so brief true peaks may read lower.
+- Peak heart rate and total energy grow with recording length; average, median and per-hour values compare better between recordings.
+- Never grade a session or predict post-exertional malaise. Compare against the user's own earlier recordings.
+""",
+    "load": r"""# Vagis Guide — Load
+
+## How to use it
+1. **Start and carry on.** No protocol and no posture to hold; the point is an ordinary stretch of the day.
+2. **Wear it for a few hours.** Longer recordings hold more still, clean stretches.
+3. **Move normally.** Everything is measured against movement, so a recording with no activity has nothing to measure from.
+4. **Stop when done.** Everything is computed on Stop.
+
+Enter age once; it sets the heart rate ceiling. Load uses the ring's own heart rate and the accelerometer only.
+
+Purpose: tracking how heart rate responds to everyday movement over long periods, to help spot changes and possible triggers.
+
+## Motion bands
+- **Still** — under 0.02 g
+- **Light** — 0.02–0.07 g
+- **Moderate** — 0.07–0.15 g
+- **High** — over 0.15 g
+
+## Tabs and graphs
+- **Timeline** — "Heart Rate & Motion" across the whole recording, with an orange line marking the heart rate ceiling (age-predicted).
+- **Motion** — "Time by motion": time spent in each motion band.
+- **Response** — "Heart rate by motion": median heart rate in each motion band.
+- **Export** — CSV files and the metrics master.
+
+## Session History metrics
+### Timeline
+- **Recording Length** (min).
+- **Lowest Heart Rate**, **Average Heart Rate**, **Maximum Heart Rate** (bpm).
+- **Heart Rate Ceiling** (bpm) — an age-predicted level used as a pacing reference.
+- **Time Above Ceiling** — time spent above the ceiling.
+
+### Motion
+- **Share of Recording Still / in Light / in Moderate / in High Motion** (%).
+- **Longest Still Stretch** (min), **Moving Bouts per Hour**, **Longest Moving Bout** (min).
+- **Average Motion** (g).
+
+### Response
+- **HR While Still / in Light / in Moderate / in High Motion** (median bpm).
+- **Still to High HR Difference** (bpm) — heart rate in high motion minus heart rate while still.
+- **Heart Rate per Motion** — how much heart rate rises for a given amount of movement, scaled to the user's own still heart rate in that recording.
+- **Heart Rate Response Delay** (s) — how long heart rate takes to follow movement.
+- **Heart Rate Range While Still** (bpm).
+
+## Notes for interpretation
+- The ceiling is a reference line, not a limit or a diagnosis.
+- Recordings differ in what the user did, so compare like with like and look at trends over many recordings.
+""",
+    "breathwork": r"""# Vagis Guide — Breathwork
+
+## How to use it
+1. Choose a pace in breaths per minute (5.0, 5.5, 6.0, 6.5, 7.0, 8, 10, 12, 14, 16, 18 or 20), Box breathing, or Free breathing.
+2. Tap Start, stay still, and follow the guide. Movement affects signal quality.
+3. Sessions must last at least 2 minutes for results.
+
+An option saves the full raw pulse trace for later analysis.
+
+## Graphs
+- **HRV Spectrum** — how heart rate variability is spread across frequencies; paced breathing produces a peak at the breathing frequency.
+- **Heart Rate** — heart rate through the session, rising and falling with each breath.
+- **RSA** — the swing in heart rate with each breath.
+- **Accel** — movement, to check the session was still.
+
+## Session History metrics
+- **Pace / mode** — the pace or mode used.
+- **Duration** (min).
+- **Average Heart Rate** (bpm).
+- **ln LF** — strength of heart rate variability in the low-frequency range (0.04–0.15 Hz), on a log scale. Slow paced breathing increases it.
+- **RSA Amplitude** (ms) — how much the time between beats swings with each breath; a marker of vagal response.
+- **Coherence** (0–1) — how closely heart rate and pulse size move together at the breathing frequency. Higher means they are more tightly linked.
+- **Pulse Wave Variability** — how much pulse size varies during the session.
+
+## Notes for interpretation
+- Sessions are most comparable at the same pace.
+""",
+    "quick_check": r"""# Vagis Guide — Quick Check
+
+## How to use it
+1. **Sit comfortably** — back supported, feet flat, legs uncrossed.
+2. **Rest the ring hand** lightly on the upper chest, just below the collarbone. Don't press.
+3. **Settle for 30 seconds** during the countdown.
+4. **Keep still.** The check needs 30 seconds of stillness. If the hand moves, a voice says "Please keep still" and the 30 seconds restart. If a steady reading isn't possible within 3 minutes, the check stops and asks to try again.
+5. **Listen for the tone** that marks the end.
+
+Optionally, enter a cuff blood pressure reading taken with the check; it is saved with that check's metrics.
+
+## Tabs and graphs
+- **Check** — the guided check.
+- **Results** — the 30-second finger pulse trace, the result tiles and the cuff entry box.
+- **Export** — CSV files and the metrics master.
+
+## Session History metrics
+- **Heart Rate** (bpm).
+- **HRV** (ms) — beat-to-beat heart rate variability (RMSSD).
+- **Breathing Rate** (breaths/min).
+- **Vascular Tone** — a Vagis index of peripheral vessel tone, measured from the pulse at the finger. It has no unit. Higher means more relaxed vessels; lower means more constricted.
+- **Cuff Systolic** and **Cuff Diastolic** (mmHg) — entered by the user, if any.
+
+## Notes for interpretation
+- **Vascular Tone is not blood pressure.** Never convert it to mmHg. It often moves with blood pressure, but they are different measures and can diverge.
+- **The Vascular Tone method is proprietary.** Do not describe, guess or speculate how it is calculated; say only that it comes from the pulse measured by the ring.
+- Cuff readings are entered by the user and may contain errors.
+- Checks are comparable only when taken the same way (seated, hand on chest). Resting heart rate from Quick Check is also used by Exertion.
+""",
+    "load_and_reserve": r"""# Vagis Guide — Load & Reserve (Analysis)
+
+## What it shows
+A cross-mode view plotting each day's **Load** (what the day spent: daytime activity and exertion) against its **Reserve** (recovery capacity from sleep, breathwork, stand and resting measures). Each sits on a 0–100 scale relative to the user's own history.
+
+The screen shows the graph of days, how many reserve and load elements had data, and a list of the elements with their current band. The more modes the user records, the more complete it gets.
+
+## Notes for interpretation
+- Use only the elements and values present. If an element has no data, say so.
+- Do not invent a single composite score.
+- Describe whether reserve is keeping pace with load and which way recent days have moved, without grading.
+""",
+    "background_data": r"""# Vagis Guide — Background Data
+
+## Genomics
+The user loads their own genome file (VCF) into the app. The file never leaves the phone. The user searches for genes or variants (for example COMT, or rs4680) and saves the ones they want; only saved variants are shared.
+
+Each saved variant includes the rsID, gene, the user's genotype, and an optional note on why it matters to them. Saved variants can be grouped.
+
+Notes: single variants usually have small effects. Explain what a variant is generally associated with, without predicting disease or giving risk numbers, and suggest a genetic counsellor or clinician for health decisions.
+
+## Questionnaires
+- **DSQ-SF** — the DePaul Symptom Questionnaire short form, used in ME/CFS.
+- **Daily VAS** — five 0–10 sliders: fatigue, PEM, brain fog, pain and sleep disturbance. Higher means worse for all five.
+
+Each submission is dated, so symptoms can be compared with ring metrics from the same days.
+
+## Calendar
+Day notes the user writes (History & Notes), plus which modes were recorded on each day. Notes are the user's own words and can give context for changes in the metrics.
+
+## Saved results
+Lab or test results the user chose to save from a chat: test name, value, unit, reference range and date only. No documents are stored.
+""",
+}
+
+
+def _guide_text(section: str) -> Optional[str]:
+    name = GUIDE_SECTIONS.get(section)
+    if not name:
+        return None
+    path = GUIDE_DIR / f"{name}.md"
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return GUIDE_TEXT.get(section)
+
+
+def _tool_get_vagis_guide(person: str, args: dict) -> str:
+    section = (args.get("section") or "").strip().lower()
+    if section and section not in GUIDE_SECTIONS:
+        return ("Unknown section. Choose one of: " + ", ".join(GUIDE_SECTIONS) + ".")
+    wanted = ["overview"] if not section else (
+        [section] if section == "overview" else ["overview", section])
+    parts = [t for t in (_guide_text(s) for s in wanted) if t]
+    if not parts:
+        return "The Vagis guide is not available on the server yet."
+    if not section:
+        parts.append("Other guide sections: " +
+                     ", ".join(s for s in GUIDE_SECTIONS if s != "overview") +
+                     ". Call get_vagis_guide with a section for a mode's guide.")
+    return "\n\n----------------------------------------\n\n".join(parts)
+
+
+def _tool_list_my_data(person: str, args: dict) -> str:
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _ai_ensure_tables(cur)
+            cur.execute("SELECT mode, row_count, uploaded_at, csv_text FROM research_uploads "
+                        "WHERE person_code = %s ORDER BY mode;", (person,))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return ("No Session History on the server yet. In the Vagis app, open "
+                "Analysis > Data Share and tap Send my data.")
+    lines = ["Session History on the server (one row per recording):"]
+    for mode, n, up, text in rows:
+        header = next(csv.reader(io.StringIO(text)), [])
+        lines.append(f"- {mode}: {n} recording(s), last sent "
+                     f"{up.strftime('%Y-%m-%d %H:%M UTC') if up else 'unknown'}; "
+                     f"columns: {', '.join(header)}")
+    return "\n".join(lines)
+
+
+def _tool_get_session_history(person: str, args: dict) -> str:
+    mode = (args.get("mode") or "").strip().lower()
+    if not mode:
+        return "Give a mode, e.g. sleep, stand, exertion, load, breathwork or quick_check."
+    last_n = args.get("last_n")
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _ai_ensure_tables(cur)
+            cur.execute("SELECT csv_text, uploaded_at FROM research_uploads "
+                        "WHERE person_code = %s AND mode = %s;", (person, mode))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return (f"No {mode} Session History on the server. Call list_my_data to see "
+                "which modes are available.")
+    text, up = row
+    lines = text.strip().splitlines()
+    if isinstance(last_n, int) and last_n > 0 and len(lines) > last_n + 1:
+        lines = [lines[0]] + lines[-last_n:]
+    sent = up.strftime("%Y-%m-%d %H:%M UTC") if up else "unknown"
+    return (f"{mode} Session History (CSV, one row per recording; last sent from the "
+            f"app {sent}). Column names are the app's file headers; the guide gives "
+            f"the names the user sees.\n\n" + "\n".join(lines))
+
+
+def _tool_save_note(person: str, args: dict) -> str:
+    note = (args.get("note") or "").strip()
+    if not note:
+        return "Nothing to save — the note was empty."
+    note = note[:AI_NOTE_MAX_CHARS]
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _ai_ensure_tables(cur)
+            cur.execute("INSERT INTO ai_notes (person_code, note) VALUES (%s, %s);",
+                        (person, note))
+    finally:
+        conn.close()
+    return "Note saved. It will be available in future conversations."
+
+
+def _tool_get_notes(person: str, args: dict) -> str:
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _ai_ensure_tables(cur)
+            cur.execute("SELECT note, created_at FROM ai_notes WHERE person_code = %s "
+                        "ORDER BY created_at DESC LIMIT %s;", (person, AI_NOTES_RETURNED))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return "No notes saved from earlier conversations yet."
+    return "Notes from earlier conversations, newest first:\n\n" + "\n\n".join(
+        f"[{c.strftime('%Y-%m-%d')}] {n}" for n, c in rows)
+
+
+AI_TOOLS: dict[str, dict[str, Any]] = {
+    "get_vagis_guide": {
+        "fn": _tool_get_vagis_guide,
+        "description": ("The Vagis guide: what the app is, the rules for answering, and "
+                        "for each mode how it is used, what its graphs show and what each "
+                        "metric means. Call with no section first for the overview and "
+                        "rules, then with a mode's section before discussing that mode."),
+        "schema": {"type": "object", "properties": {
+            "section": {"type": "string", "enum": list(GUIDE_SECTIONS),
+                        "description": "Guide section. Omit for the overview and rules."}},
+            "additionalProperties": False},
+    },
+    "list_my_data": {
+        "fn": _tool_list_my_data,
+        "description": ("Which Vagis modes have Session History on the server, how many "
+                        "recordings each holds, when they were last sent, and the columns."),
+        "schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    "get_session_history": {
+        "fn": _tool_get_session_history,
+        "description": ("One mode's Session History as CSV: one row per recording with that "
+                        "recording's metrics. Use it to answer questions, compare recordings, "
+                        "graph trends or run statistics."),
+        "schema": {"type": "object", "properties": {
+            "mode": {"type": "string",
+                     "description": "Mode name as listed by list_my_data, e.g. sleep, stand, "
+                                    "exertion, load, breathwork, quick_check."},
+            "last_n": {"type": "integer", "minimum": 1,
+                       "description": "Optional: only the most recent N recordings."}},
+            "required": ["mode"], "additionalProperties": False},
+    },
+    "save_note": {
+        "fn": _tool_save_note,
+        "description": ("Save a short note about this conversation (what was looked at, "
+                        "what the user wants to follow) so future conversations can pick up "
+                        "where this one left off. Ask the user before saving. Metric "
+                        "observations only — no names or identifying details."),
+        "schema": {"type": "object", "properties": {
+            "note": {"type": "string", "description": "The note, a few sentences."}},
+            "required": ["note"], "additionalProperties": False},
+    },
+    "get_notes": {
+        "fn": _tool_get_notes,
+        "description": "Notes saved from earlier conversations with this user, newest first.",
+        "schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+}
+
+AI_INSTRUCTIONS = (
+    "Vagis connector: the user's own Vagis smart-ring metrics. At the start of a "
+    "conversation call get_vagis_guide (overview and rules) and get_notes. Before "
+    "discussing a mode, read its guide section. Follow the guide's rules: research "
+    "use only, no diagnosis, label metrics by what was measured, compare the user "
+    "with their own history, and never describe how metrics are calculated. Use "
+    "get_session_history for the data. Offer to save a short note at the end of a "
+    "useful conversation."
+)
+
+
+# ---- MCP over HTTP (JSON-RPC, stateless, JSON responses) -----------------
+def _rpc_result(msg_id: Any, result: dict) -> dict:
+    return {"jsonrpc": "2.0", "id": msg_id, "result": result}
+
+
+def _rpc_error(msg_id: Any, code: int, message: str) -> dict:
+    return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
+
+
+def _mcp_handle(person: str, msg: Any) -> Optional[dict]:
+    if not isinstance(msg, dict):
+        return _rpc_error(None, -32600, "Invalid request")
+    method = msg.get("method")
+    msg_id = msg.get("id")
+    if msg_id is None:            # a notification: no reply
+        return None
+    params = msg.get("params") or {}
+
+    if method == "initialize":
+        asked = params.get("protocolVersion")
+        version = asked if asked in MCP_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSIONS[0]
+        return _rpc_result(msg_id, {
+            "protocolVersion": version,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "vagis", "title": "Vagis", "version": "1.0.0"},
+            "instructions": AI_INSTRUCTIONS,
+        })
+    if method == "ping":
+        return _rpc_result(msg_id, {})
+    if method == "tools/list":
+        return _rpc_result(msg_id, {"tools": [
+            {"name": n, "description": t["description"], "inputSchema": t["schema"]}
+            for n, t in AI_TOOLS.items()]})
+    if method == "tools/call":
+        name = params.get("name")
+        tool = AI_TOOLS.get(name)
+        if not tool:
+            return _rpc_error(msg_id, -32602, f"Unknown tool: {name}")
+        args = params.get("arguments") or {}
+        try:
+            text = tool["fn"](person, args if isinstance(args, dict) else {})
+            return _rpc_result(msg_id, {"content": [{"type": "text", "text": text}],
+                                        "isError": False})
+        except Exception as e:
+            print(f"[ai-connect] tool {name} failed: {type(e).__name__}: {e}")
+            return _rpc_result(msg_id, {"content": [{"type": "text",
+                               "text": "The Vagis server could not complete that request."}],
+                               "isError": True})
+    return _rpc_error(msg_id, -32601, f"Method not found: {method}")
+
+
+@app.post("/mcp/{key}")
+async def mcp_endpoint(key: str, request: Request):
+    person = await asyncio.to_thread(_ai_person_for_key, key)
+    if not person:
+        return JSONResponse(status_code=404,
+                            content={"error": "Unknown or retired Vagis connector address."})
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content=_rpc_error(None, -32700, "Parse error"))
+
+    if isinstance(body, list):
+        replies = [r for r in [await asyncio.to_thread(_mcp_handle, person, m) for m in body] if r]
+        return JSONResponse(replies) if replies else Response(status_code=202)
+    reply = await asyncio.to_thread(_mcp_handle, person, body)
+    return JSONResponse(reply) if reply else Response(status_code=202)
+
+
+@app.get("/mcp/{key}")
+def mcp_get(key: str):
+    # No server-initiated stream; clients fall back to plain POST replies.
+    return Response(status_code=405, headers={"Allow": "POST"})
+
+
+@app.delete("/mcp/{key}")
+def mcp_delete(key: str):
+    return Response(status_code=405, headers={"Allow": "POST"})
+
+
+# ---- Admin: make a connector address ------------------------------------
+@app.post("/admin/ui/aiconnect", response_class=HTMLResponse)
+def admin_ui_aiconnect(request: Request, token: str = Form(""),
+                       person_code: str = Form("")) -> HTMLResponse:
+    if token.strip() != (VAGIS_ADMIN_TOKEN or "").strip() or not VAGIS_ADMIN_TOKEN:
+        return HTMLResponse(_admin_page(token, '<div class="err">Admin token did not match.</div>'))
+    parsed = parse_person_code(person_code)
+    if not parsed or parsed["kind"] != "research":
+        return HTMLResponse(_admin_page(token,
+            '<div class="err">Enter a valid SE code (AI Connect uses SE codes for now).</div>'))
+    code = parsed["person_code"]
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _ai_ensure_tables(cur)
+            if not person_exists(cur, code, "research"):
+                return HTMLResponse(_admin_page(token,
+                    '<div class="err">That SE code has not been issued.</div>'))
+            key = _ai_issue_key(cur, code)
+    finally:
+        conn.close()
+    base = str(request.base_url).rstrip("/").replace("http://", "https://")
+    url = f"{base}/mcp/{key}"
+    banner = (
+        '<div class="result">'
+        f'<div class="row"><span class="k">Person</span><span class="v">{_esc(code)}</span></div>'
+        f'<div class="row"><span class="k">Connector address</span>'
+        f'<span class="v" style="word-break:break-all">{_esc(url)}</span></div>'
+        '<div class="warn">Paste this into Claude: Customize &gt; Connectors &gt; + &gt; '
+        'Add custom connector. Keep it private &mdash; anyone with it can read this '
+        "person's metrics. Making a new one retires this one. Not shown again.</div>"
+        '</div>'
+    )
+    return HTMLResponse(_admin_page(token, banner))
