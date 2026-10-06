@@ -3392,7 +3392,10 @@ def _tool_get_saved_variants(person: str, args: dict) -> str:
             "list, named in group). genotype = the user's bases; genotype_raw = the "
             "VCF call (0 = reference allele, 1 = first alt). gene is blank when the "
             "variant isn't in the app's gene list. Positions are as in the user's "
-            "VCF file.\n\n" + out.getvalue())
+            "VCF file. call = vcf (read from the user's VCF) or inferred_reference "
+            "(not in the VCF; a sequencing VCF lists only positions that differ from "
+            "the reference, so the user most likely has two reference copies — say it "
+            "is inferred, not measured).\n\n" + out.getvalue())
 
 
 def _tool_get_session_history(person: str, args: dict) -> str:
