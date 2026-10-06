@@ -3571,3 +3571,89 @@ def admin_ui_aiconnect(request: Request, token: str = Form(""),
         '</div>'
     )
     return HTMLResponse(_admin_page(token, banner))
+
+
+# ==========================================================================
+# VAGIS HELP — the in-app help chat (all users)
+# ==========================================================================
+# Answers questions about how to use the app and what its graphs and metrics
+# mean, using only the Vagis guide (GUIDE_TEXT above). It receives no user
+# data, has no internet and runs no statistics.
+#
+# Uses a small, inexpensive model with the guide cached between questions.
+# Shares the per-phone daily/monthly question caps with /chat.
+# --------------------------------------------------------------------------
+HELP_MODEL = os.environ.get("VAGIS_HELP_MODEL", "claude-haiku-4-5")
+HELP_MAX_TOKENS = int(os.environ.get("VAGIS_HELP_MAX_TOKENS", "700"))
+HELP_MAX_TURNS = 12   # most recent messages sent with each question
+
+HELP_RULES = """You are Vagis Help, the help assistant inside the Vagis app.
+
+Answer questions about how to use the Vagis app and what its modes, graphs and
+metrics mean, using ONLY the Vagis guide below.
+
+- You have no access to the user's data. If the user types in numbers or
+  describes results, you may discuss them, following the guide's rules: research
+  use only, no diagnosis, no severity words, compare with the user's own history.
+- If the guide does not cover something, say so plainly rather than guessing.
+- Never describe how any metric is calculated.
+- For deeper questions about their own data, users can tap the share icon on a
+  graph and choose "Send to AI" to discuss it with their own chat assistant.
+- Keep answers short and plain. Use the metric names exactly as the app shows them.
+
+THE VAGIS GUIDE
+"""
+
+
+class HelpTurn(BaseModel):
+    role: str = Field(pattern="^(user|assistant)$")
+    content: str = Field(min_length=1, max_length=4000)
+
+
+class HelpRequest(BaseModel):
+    conversation: list[HelpTurn]
+
+
+class HelpResponse(BaseModel):
+    reply: str
+
+
+def _help_system() -> list[dict]:
+    guide = "\n\n----------------------------------------\n\n".join(
+        _guide_text(s) or "" for s in GUIDE_SECTIONS)
+    return [{"type": "text", "text": HELP_RULES + guide,
+             "cache_control": {"type": "ephemeral"}}]
+
+
+@app.post("/help/chat", response_model=HelpResponse)
+def help_chat(req: HelpRequest, authorization: str | None = Header(default=None),
+              x_vagis_device: str | None = Header(default=None)) -> HelpResponse:
+    check_app_auth(authorization)
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=500, detail="Help is not configured on the server.")
+    turns = req.conversation[-HELP_MAX_TURNS:]
+    while turns and turns[0].role != "user":
+        turns = turns[1:]
+    if not turns or turns[-1].role != "user":
+        raise HTTPException(status_code=400, detail="No question provided.")
+
+    device_id = (x_vagis_device or "").strip()[:64]
+    if device_id and device_id not in AGENT_EXEMPT_DEVICES:
+        _check_agent_cap(device_id)
+
+    try:
+        message = client.messages.create(
+            model=HELP_MODEL, max_tokens=HELP_MAX_TOKENS, system=_help_system(),
+            messages=[{"role": t.role, "content": t.content} for t in turns])
+    except anthropic.APIStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Help is unavailable right now ({e.status_code}).")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Help is unavailable right now ({type(e).__name__}).")
+
+    reply = "".join(b.text for b in message.content if getattr(b, "type", None) == "text").strip()
+    if not reply:
+        raise HTTPException(status_code=502, detail="Help returned an empty answer. Please try again.")
+    if device_id:
+        _agent_record(device_id)
+    return HelpResponse(reply=reply)
+
