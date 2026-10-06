@@ -3016,7 +3016,7 @@ Sleep uses the ring's red/infrared light. Stopping a recording analyses that nig
 ## Tabs and graphs
 - **Stages** — a hypnogram of Awake, REM, Light and Deep sleep across the night, with a motion strip underneath. Stages come from heart rate, pulse and movement, not brain waves, so they are an estimate.
 - **Heart Rate** — heart rate across the night with movement underneath.
-- **Cycling** — "Pulse Wave Cycling": overlapping curves showing how many cycling episodes occurred in each 5 minutes of the night. Blue is PWA Cycling, dark red is PWA-HR Cycling.
+- **Cycling** — "Pulse Wave Cycling": three lanes across the night, one each for PWA-HR cycling (sky blue), PWA-cycling (strong blue) and Vaso-cycling (light cyan). The strength of the shading shows how much of each 5-minute period was spent in that state; there is no vertical scale. The number at top right is PWA-cycling plus PWA-HR cycling per hour of sleep. Below the graph, a card for each shows Per hour and Time (min).
 - **Deep** — two traces from a 5-minute stretch of Deep sleep: the time between beats (RR interval, blue) above the pulse wave amplitude (PWA, orange).
 - **Bands** — a bar for each vascular rhythm band, measured on a 30-minute stretch of non-REM sleep (at least 20 minutes of it light, no REM or waking). Each bar is how much pulse size swings in that band, as a percentage of its own mean. Bands: Endothelial 0.005–0.0095 Hz, Endothelial-NO 0.0095–0.021 Hz, Neurogenic 0.021–0.052 Hz, Myogenic 0.052–0.145 Hz.
 - **Export** — CSV files for each recording and the cumulative metrics file.
@@ -3043,14 +3043,14 @@ Sleep uses the ring's red/infrared light. Stopping a recording analyses that nig
 - **Overnight HR Dip** (%) — how far heart rate falls during the night.
 
 ### Cycling
-Slow, repeating rises and falls in pulse size during sleep fall into three groups:
-- **Vaso-cycling** — cycling within the depth the user shows in their own Deep sleep; their own normal vessel rhythm.
-- **PWA Cycling** — cycling deeper than the user's own Deep sleep range, without a heart-rate surge.
-- **PWA-HR Cycling** — cycling with a heart-rate surge at the same time.
+Every minute of sleep is placed in exactly one of three states, so the three times add up to the night's total:
+- **Vaso-cycling** — the slow, resting rhythm of the finger's blood vessels, no stronger than the person shows in their own Deep sleep. A resting state, not an event.
+- **PWA-cycling** — slow swings in pulse size stronger than the person's own Deep-sleep level, without a heart-rate surge.
+- **PWA-HR cycling** — the same, with a heart-rate surge larger than the person's own Deep-sleep heart-rate swing.
 
-Each group is reported per hour of sleep and as total minutes. **Total Obstruction (PWA + PWA-HR)** is PWA Cycling plus PWA-HR Cycling per hour of sleep.
+Each is shown as **Per hour** (per hour of sleep) and **Time** (min). **Total** is PWA-cycling plus PWA-HR cycling; it does not include Vaso-cycling. In Session History the trend choices are PWA-HR, PWA, Vaso and Total, plus each one's minutes.
 
-These are measured pulse-wave patterns. Breathing disruption can occur without a fall in oxygen, so these patterns are not expected to match oximetry. Do not call them apneas or convert them to AHI.
+These are measured pulse-wave patterns, not breathing events. They are not expected to match oximetry. Do not call them apneas or convert them to AHI.
 
 ### Deep
 Measured on the user's Deep sleep:
@@ -3656,4 +3656,3 @@ def help_chat(req: HelpRequest, authorization: str | None = Header(default=None)
     if device_id:
         _agent_record(device_id)
     return HelpResponse(reply=reply)
-
