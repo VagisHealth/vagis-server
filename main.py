@@ -2887,6 +2887,7 @@ def _build_summary_pdf(title: str, text: str, images: list[bytes]) -> bytes:
 #   get_vagis_guide      the overview, rules and mode guides (GUIDE_TEXT below)
 #   list_my_data         which modes have Session History on the server
 #   get_session_history  one mode's Session History (CSV, one row per recording)
+#   get_saved_variants   genomic variants the user saved in the app's Genomics
 #   save_note / get_notes  short notes carried between conversations
 #
 # Only Session History metrics (what the app uploads via Data Share) are ever
@@ -3271,7 +3272,7 @@ The screen shows the graph of days, how many reserve and load elements had data,
 ## Genomics
 The user loads their own genome file (VCF) into the app. The file never leaves the phone. The user searches for genes or variants (for example COMT, or rs4680) and saves the ones they want; only saved variants are shared.
 
-Each saved variant includes the rsID, gene, the user's genotype, and an optional note on why it matters to them. Saved variants can be grouped.
+Each saved variant includes the rsID, gene, the user's genotype, and an optional note on why it matters to them. Saved variants can be grouped. Read them with get_saved_variants; they reach the server when the user taps Send my data in Data Share. If a variant the user asks about isn't saved, ask them to search it in Genomics, save it, and send again.
 
 Notes: single variants usually have small effects. Explain what a variant is generally associated with, without predicting disease or giving risk numbers, and suggest a genetic counsellor or clinician for health decisions.
 
@@ -3332,11 +3333,66 @@ def _tool_list_my_data(person: str, args: dict) -> str:
                 "Analysis > Data Share and tap Send my data.")
     lines = ["Session History on the server (one row per recording):"]
     for mode, n, up, text in rows:
+        if mode == GENOMICS_MODE:
+            continue
         header = next(csv.reader(io.StringIO(text)), [])
         lines.append(f"- {mode}: {n} recording(s), last sent "
                      f"{up.strftime('%Y-%m-%d %H:%M UTC') if up else 'unknown'}; "
                      f"columns: {', '.join(header)}")
+    gen = next((r for r in rows if r[0] == GENOMICS_MODE), None)
+    if gen and gen[1]:
+        lines.append(f"\nSaved genomic variants: {gen[1]}, last sent "
+                     f"{gen[2].strftime('%Y-%m-%d %H:%M UTC') if gen[2] else 'unknown'}. "
+                     "Read them with get_saved_variants.")
+    else:
+        lines.append("\nNo saved genomic variants on the server.")
     return "\n".join(lines)
+
+
+GENOMICS_MODE = "genomics"
+
+
+def _tool_get_saved_variants(person: str, args: dict) -> str:
+    """Saved variants as uploaded by Data Share (mode "genomics"), optionally
+    filtered by gene or group name."""
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _ai_ensure_tables(cur)
+            cur.execute("SELECT csv_text, uploaded_at FROM research_uploads "
+                        "WHERE person_code = %s AND mode = %s;", (person, GENOMICS_MODE))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    none_msg = ("No saved genomic variants on the server. In the Vagis app, search and "
+                "save variants in Genomics, then open Analysis > Data Share and tap "
+                "Send my data.")
+    if not row:
+        return none_msg
+    text, up = row
+    recs = list(csv.DictReader(io.StringIO(text)))
+    if not recs:
+        return none_msg
+    gene = (args.get("gene") or "").strip().upper()
+    group = (args.get("group") or "").strip().lower()
+    if gene:
+        recs = [r for r in recs if (r.get("gene") or "").upper() == gene]
+    if group:
+        recs = [r for r in recs if (r.get("group") or "").lower() == group]
+    if not recs:
+        return "No saved variants match that filter."
+    cols = list(recs[0].keys())
+    out = io.StringIO()
+    w = csv.DictWriter(out, fieldnames=cols, lineterminator="\n")
+    w.writeheader()
+    w.writerows(recs)
+    sent = up.strftime("%Y-%m-%d %H:%M UTC") if up else "unknown"
+    return (f"Saved genomic variants (CSV; last sent from the app {sent}). "
+            "source = saved (picked individually) or group (from an imported study "
+            "list, named in group). genotype = the user's bases; genotype_raw = the "
+            "VCF call (0 = reference allele, 1 = first alt). gene is blank when the "
+            "variant isn't in the app's gene list. Positions are as in the user's "
+            "VCF file.\n\n" + out.getvalue())
 
 
 def _tool_get_session_history(person: str, args: dict) -> str:
@@ -3429,6 +3485,19 @@ AI_TOOLS: dict[str, dict[str, Any]] = {
                        "description": "Optional: only the most recent N recordings."}},
             "required": ["mode"], "additionalProperties": False},
     },
+    "get_saved_variants": {
+        "fn": _tool_get_saved_variants,
+        "description": ("Genomic variants the user saved in the Vagis app's Genomics "
+                        "section: rsID, gene, position, alleles, the user's genotype and "
+                        "their note. Only variants the user chose to save; the genome "
+                        "file never leaves the phone. Read the background_data guide "
+                        "section before discussing them."),
+        "schema": {"type": "object", "properties": {
+            "gene": {"type": "string", "description": "Optional: only this gene, e.g. COMT."},
+            "group": {"type": "string",
+                      "description": "Optional: only variants from this imported group."}},
+            "additionalProperties": False},
+    },
     "save_note": {
         "fn": _tool_save_note,
         "description": ("Save a short note about this conversation (what was looked at, "
@@ -3452,7 +3521,7 @@ AI_INSTRUCTIONS = (
     "discussing a mode, read its guide section. Follow the guide's rules: research "
     "use only, no diagnosis, label metrics by what was measured, compare the user "
     "with their own history, and never describe how metrics are calculated. Use "
-    "get_session_history for the data. Offer to save a short note at the end of a "
+    "get_session_history for the data and get_saved_variants for saved genomic variants. Offer to save a short note at the end of a "
     "useful conversation."
 )
 
