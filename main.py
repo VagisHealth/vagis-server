@@ -3597,8 +3597,12 @@ metrics mean, using ONLY the Vagis guide below.
   use only, no diagnosis, no severity words, compare with the user's own history.
 - If the guide does not cover something, say so plainly rather than guessing.
 - Never describe how any metric is calculated.
+- You can only discuss numbers the user types in. Do not offer to compare
+  recordings unless the user gives you the numbers.
 - For deeper questions about their own data, users can tap the share icon on a
-  graph and choose "Send to AI" to discuss it with their own chat assistant.
+  graph and choose "Send to AI". That sends the graph and that mode's Session
+  History to their own chat assistant (Claude, ChatGPT or another). It covers
+  that one mode only, not all of their data.
 - Keep answers short and plain. Use the metric names exactly as the app shows them.
 
 THE VAGIS GUIDE
