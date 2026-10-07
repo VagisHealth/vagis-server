@@ -189,6 +189,71 @@ CREATE TABLE IF NOT EXISTS persons (
 );
 """
 
+# --------------------------------------------------------------------------
+# VAGIS CODES — one permanent code per person (replaces SE/PT/RES/PHY)
+# --------------------------------------------------------------------------
+# Format VG-XXXX-XXXX: 8 random characters from an alphabet with no look-alikes
+# (no O/0, I/1/L). The code carries no meaning: not a study, not a provider.
+# What a person can use is decided by their tier, stored next to the code.
+# Their data lives in research_uploads under the code (same table as before).
+VG_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+VG_TIERS = ("free", "premium")
+
+CREATE_PEOPLE_SQL = """
+CREATE TABLE IF NOT EXISTS vagis_people (
+    code         TEXT PRIMARY KEY,
+    name         TEXT,
+    email        TEXT,
+    tier         TEXT NOT NULL DEFAULT 'free',
+    legacy_code  TEXT UNIQUE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+
+# Graph data: one small time series per recording per graph (e.g. the sleep
+# hypnogram's stage per 30 s), so a connected agent can redraw the app's graphs
+# without raw data. GENERIC: the app names the mode and graph; the server
+# stores whatever arrives and the connector lists whatever is there, so a new
+# graph later is an app change plus a GRAPH_STYLES entry, nothing else.
+CREATE_TIMELINES_SQL = """
+CREATE TABLE IF NOT EXISTS vagis_timelines (
+    id           SERIAL PRIMARY KEY,
+    person_code  TEXT NOT NULL,
+    mode         TEXT NOT NULL,
+    graph        TEXT NOT NULL,
+    local_start  TEXT NOT NULL,
+    csv_text     TEXT NOT NULL,
+    row_count    INTEGER,
+    uploaded_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (person_code, mode, graph, local_start)
+);
+"""
+
+
+def make_vg_code() -> str:
+    body = "".join(secrets.choice(VG_ALPHABET) for _ in range(8))
+    return f"VG-{body[:4]}-{body[4:]}"
+
+
+def parse_vg_code(raw: str) -> Optional[str]:
+    """Canonical VG-XXXX-XXXX, or None. Accepts any case, spaces or dashes."""
+    s = "".join(ch for ch in (raw or "").upper() if ch.isalnum())
+    if len(s) == 10 and s.startswith("VG") and all(c in VG_ALPHABET for c in s[2:]):
+        return f"VG-{s[2:6]}-{s[6:]}"
+    return None
+
+
+def vg_person(cur, code: str) -> Optional[dict[str, Any]]:
+    cur.execute("SELECT code, name, email, tier, legacy_code, created_at "
+                "FROM vagis_people WHERE code = %s;", (code,))
+    r = cur.fetchone()
+    if not r:
+        return None
+    return {"code": r[0], "name": r[1], "email": r[2], "tier": r[3],
+            "legacy_code": r[4], "created_at": r[5]}
+
+
 # research_uploads: PERSISTENT. One row per (subject, mode); re-upload replaces.
 CREATE_RESEARCH_UPLOADS_SQL = """
 CREATE TABLE IF NOT EXISTS research_uploads (
@@ -263,6 +328,8 @@ def ensure_tables(cur) -> None:
     cur.execute(CREATE_RESEARCH_UPLOADS_SQL)
     cur.execute(CREATE_CLINICAL_HOLDS_SQL)
     cur.execute(CREATE_AGENT_USAGE_SQL)
+    cur.execute(CREATE_PEOPLE_SQL)
+    cur.execute(CREATE_TIMELINES_SQL)
     # Cache of the Anthropic Files API id for each stored CSV, so the analysis
     # agent reads data off disk in its sandbox instead of having it inlined in
     # the prompt. Re-uploaded only when the underlying CSV is newer.
@@ -739,10 +806,14 @@ async def ingest(
     SE -> research_uploads (persistent). PT -> clinical_holds (ephemeral, 48h)."""
     check_app_auth(authorization)
 
+    vg = parse_vg_code(enrollment_code)
+    if vg:
+        return await _ingest_vg(vg, mode, file)
+
     parsed = parse_person_code(enrollment_code)
     if not parsed:
         raise HTTPException(status_code=400,
-            detail="enrollment_code must be a valid SE or PT code.")
+            detail="That isn't a valid Vagis code.")
     code = parsed["person_code"]
     kind = parsed["kind"]
 
@@ -795,6 +866,83 @@ async def ingest(
         conn.close()
 
 
+async def _ingest_vg(code: str, mode: str, file: UploadFile) -> dict[str, Any]:
+    """Store one Session History CSV under a VG code (persistent)."""
+    mode_clean = (mode or "").strip().lower()
+    if not mode_clean:
+        raise HTTPException(status_code=400, detail="mode is required.")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File too large.")
+    try:
+        csv_text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="File must be UTF-8 text CSV.")
+    row_count = count_csv_rows(csv_text)
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            if not vg_person(cur, code):
+                raise HTTPException(status_code=404, detail="That Vagis code isn't recognized.")
+            cur.execute(UPSERT_RESEARCH_SQL, (code, mode_clean, file.filename, csv_text, row_count))
+            uploaded_at = cur.fetchone()[0]
+    finally:
+        conn.close()
+    return {"status": "ok", "enrollment_code": code, "mode": mode_clean,
+            "row_count": row_count, "uploaded_at": uploaded_at.isoformat()}
+
+
+@app.post("/ingest/timeline")
+async def ingest_timeline(
+    enrollment_code: str = Form(...),
+    mode: str = Form(...),
+    graph: str = Form(...),
+    local_start: str = Form(...),
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Store one recording's graph data. local_start is the recording's start
+    in the phone's local time, ISO 8601 with offset (2026-10-03T23:12:00-07:00).
+    Sending the same mode/graph/start again replaces it."""
+    check_app_auth(authorization)
+    code = parse_vg_code(enrollment_code)
+    if not code:
+        raise HTTPException(status_code=400, detail="Graph data needs a Vagis (VG) code.")
+    mode_c = (mode or "").strip().lower()
+    graph_c = (graph or "").strip().lower()
+    start = (local_start or "").strip()
+    if not mode_c or not graph_c or len(start) < 16:
+        raise HTTPException(status_code=400, detail="mode, graph and local_start are required.")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File too large.")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="File must be UTF-8 text CSV.")
+    n = count_csv_rows(text)
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            if not vg_person(cur, code):
+                raise HTTPException(status_code=404, detail="That Vagis code isn't recognized.")
+            cur.execute("""
+                INSERT INTO vagis_timelines (person_code, mode, graph, local_start, csv_text, row_count)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (person_code, mode, graph, local_start)
+                DO UPDATE SET csv_text = EXCLUDED.csv_text, row_count = EXCLUDED.row_count,
+                              uploaded_at = now();""", (code, mode_c, graph_c, start, text, n))
+    finally:
+        conn.close()
+    return {"status": "ok", "mode": mode_c, "graph": graph_c, "local_start": start, "row_count": n}
+
+
 class ValidateRequest(BaseModel):
     enrollment_code: str
 
@@ -804,6 +952,19 @@ def validate_person(req: ValidateRequest,
                     authorization: str | None = Header(default=None)) -> dict[str, Any]:
     """App checks an SE or PT code is well-formed AND issued. Returns its provider."""
     check_app_auth(authorization)
+    vg = parse_vg_code(req.enrollment_code)
+    if vg:
+        conn = db_connect()
+        try:
+            with conn, conn.cursor() as cur:
+                ensure_tables(cur)
+                person = vg_person(cur, vg)
+        finally:
+            conn.close()
+        if not person:
+            return {"valid": False, "reason": "not_issued"}
+        return {"valid": True, "enrollment_code": vg, "tier": person["tier"]}
+
     parsed = parse_person_code(req.enrollment_code)
     if not parsed:
         return {"valid": False, "reason": "malformed"}
@@ -949,49 +1110,40 @@ def _mode_label(m: str) -> str:
 
 
 # ---- Admin page ----------------------------------------------------------
-def _admin_page(token: str = "", banner: str = "") -> str:
+def _admin_page(token: str = "", banner: str = "", people_html: str = "") -> str:
     tok = _esc(token)
+    tier_opts = "".join(f'<option value="{t}">{t.capitalize()}</option>' for t in VG_TIERS)
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Vagis Admin</title>{_style()}</head><body>
   <h1>Vagis Admin</h1>
-  <p class="sub">Create provider accounts for the research and clinical systems.</p>
+  <p class="sub">One Vagis code per person, for life.</p>
   {banner}
   <div class="card">
-    <h2>Create a provider</h2>
-    <form method="post" action="/admin/ui/create">
+    <h2>Add a person</h2>
+    <p class="sub">Makes their Vagis code and their personal Claude/ChatGPT connector address.</p>
+    <form method="post" action="/admin/ui/person/add">
       <label>Admin token</label>
       <input name="token" type="password" placeholder="Your VAGIS_ADMIN_TOKEN" value="{tok}" autocomplete="off">
-      <label>System</label>
-      <select name="kind">
-        <option value="research">Research  (RES &mdash; persistent study data)</option>
-        <option value="clinical">Clinical  (PHY &mdash; ephemeral, 48h)</option>
-      </select>
-      <label>Name (optional)</label>
-      <input name="name" type="text" placeholder="Dr. Jane Smith">
-      <label>Provider email (required)</label>
-      <input name="email" type="text" placeholder="jane@example.com">
-      <button type="submit">Create provider</button>
+      <label>Name</label>
+      <input name="name" type="text" placeholder="Tess">
+      <label>Email</label>
+      <input name="email" type="text" placeholder="tess@example.com">
+      <label>Tier</label>
+      <select name="tier">{tier_opts}</select>
+      <label>Old code (optional)</label>
+      <input name="old_code" type="text" placeholder="SE0030001ABC &mdash; moves their existing data to the new code">
+      <button type="submit">Add person</button>
     </form>
   </div>
   <div class="card">
-    <h2>AI Connect key</h2>
-    <p class="sub">Make a private connector address so a person's Claude or ChatGPT can read their Session History.</p>
-    <form method="post" action="/admin/ui/aiconnect">
+    <h2>People</h2>
+    <form method="post" action="/admin/ui/people">
       <label>Admin token</label>
       <input name="token" type="password" placeholder="Your VAGIS_ADMIN_TOKEN" value="{tok}" autocomplete="off">
-      <label>Person code (SE)</label>
-      <input name="person_code" type="text" placeholder="SE0010001K3P">
-      <button type="submit">Make connector address</button>
+      <button type="submit" class="secondary">Show people</button>
     </form>
-  </div>
-  <div class="card">
-    <h2>Providers</h2>
-    <form method="post" action="/admin/ui/list">
-      <label>Admin token</label>
-      <input name="token" type="password" placeholder="Your VAGIS_ADMIN_TOKEN" value="{tok}" autocomplete="off">
-      <button type="submit" class="secondary">Show list</button>
-    </form>
+    {people_html}
   </div>
 </body></html>"""
 
@@ -3330,7 +3482,7 @@ def _tool_list_my_data(person: str, args: dict) -> str:
         conn.close()
     if not rows:
         return ("No Session History on the server yet. In the Vagis app, open "
-                "Analysis > Data Share and tap Send my data.")
+                "Analysis > Data Share and tap Send my data." + _graph_data_summary(person))
     lines = ["Session History on the server (one row per recording):"]
     for mode, n, up, text in rows:
         if mode == GENOMICS_MODE:
@@ -3346,10 +3498,114 @@ def _tool_list_my_data(person: str, args: dict) -> str:
                      "Read them with get_saved_variants.")
     else:
         lines.append("\nNo saved genomic variants on the server.")
+    lines.append(_graph_data_summary(person))
     return "\n".join(lines)
 
 
 GENOMICS_MODE = "genomics"
+
+
+# ---- Graph data (redrawing the app's graphs) -----------------------------
+# How each graph looks in the app, so the agent's redraw matches it. Keyed
+# "mode/graph". A graph with no entry here is still listed and returned; the
+# agent then just plots its columns against time.
+GRAPH_STYLE_COMMON = (
+    "Draw on a black background with white/grey text, no chart junk. The time column "
+    "is local clock time. Label the x-axis with whole hours (hour number only for "
+    "overnight graphs). When the user asks for several recordings, stack them one "
+    "above the other sharing the same x-axis (align by clock time for sleep, by "
+    "elapsed time otherwise) or place them side by side, as the user prefers, each "
+    "titled with its date. Never draw raw data; these are the app's derived values."
+)
+GRAPH_STYLES: dict[str, str] = {
+    "sleep/stages": (
+        "Sleep Stages hypnogram. Columns: time, stage (Wake, REM, Light, Deep), one row "
+        "per 30 s. Draw as a stepped hypnogram with rows top to bottom Wake, REM, Light, "
+        "Deep; colour each segment by stage: Wake #FFFFFF, REM #5AA6EE, Light #3554C9, "
+        "Deep #4FDBFF."),
+    "sleep/heart_rate": (
+        "Overnight heart rate. Columns: time, hr (bpm). Line #3B82F6, y-axis in bpm."),
+    "sleep/cycling": (
+        "Pulse Wave Cycling. Columns: time (start of each 5-min bin), pwa_hr, pwa, vaso "
+        "(counts in that bin). Draw THREE LANES, not overlaid curves, top to bottom: "
+        "PWA-HR cycling #5AA6EE, PWA-cycling #3554C9, Vaso-cycling #4FDBFF. In each lane "
+        "fill a block for every bin with a count above zero; opacity 0.35 + 0.65 x "
+        "(count / the night's largest bin count across all three). No y-axis scale. "
+        "Never add Vaso-cycling to the other two as a total."),
+    "load/timeline": (
+        "Load Timeline. Columns: time, hr (bpm), motion_g (g). Heart rate as a line "
+        "#3B82F6 in an upper panel; motion below it as a filled area sharing the time "
+        "axis. Motion bands: Still < 0.02 g, Light 0.02-0.07, Moderate 0.07-0.15, "
+        "High > 0.15 g."),
+    "exertion/heart_rate": (
+        "Exertion heart rate. Columns: time, hr (bpm), from the ring's stored HR. "
+        "Line #3B82F6, y-axis in bpm."),
+    "stand/heart_rate": (
+        "Stand test heart rate. Columns: time, hr (bpm), phase (Supine 1, Standing, "
+        "Supine 2). Line #3B82F6; shade or label each phase band behind the line; the "
+        "standing cue is where phase changes to Standing."),
+}
+
+
+def _graph_data_summary(person: str) -> str:
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            cur.execute("SELECT mode, graph, COUNT(*), MIN(local_start), MAX(local_start) "
+                        "FROM vagis_timelines WHERE person_code = %s "
+                        "GROUP BY mode, graph ORDER BY mode, graph;", (person,))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return "\nNo graph data on the server yet."
+    out = ["\nGraph data for redrawing the app's graphs (read with get_graph_data):"]
+    for mode, graph, n, lo, hi in rows:
+        out.append(f"- {mode}/{graph}: {n} recording(s), {lo[:10]} to {hi[:10]}")
+    return "\n".join(out)
+
+
+def _tool_get_graph_data(person: str, args: dict) -> str:
+    mode = (args.get("mode") or "").strip().lower()
+    graph = (args.get("graph") or "").strip().lower()
+    dates = [str(d)[:10] for d in (args.get("dates") or []) if d]
+    latest = max(1, min(int(args.get("latest") or 1), 14))
+    if not mode or not graph:
+        return "Give mode and graph, e.g. mode=sleep, graph=stages. list_my_data lists them."
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            if dates:
+                cur.execute("SELECT local_start, csv_text FROM vagis_timelines "
+                            "WHERE person_code = %s AND mode = %s AND graph = %s "
+                            "AND LEFT(local_start, 10) = ANY(%s) ORDER BY local_start;",
+                            (person, mode, graph, dates[:14]))
+            else:
+                cur.execute("SELECT local_start, csv_text FROM vagis_timelines "
+                            "WHERE person_code = %s AND mode = %s AND graph = %s "
+                            "ORDER BY local_start DESC LIMIT %s;", (person, mode, graph, latest))
+            rows = cur.fetchall()
+            if not dates:
+                rows = rows[::-1]
+            cur.execute("SELECT DISTINCT LEFT(local_start, 10) FROM vagis_timelines "
+                        "WHERE person_code = %s AND mode = %s AND graph = %s "
+                        "ORDER BY 1 DESC LIMIT 60;", (person, mode, graph))
+            available = [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+    if not rows:
+        avail = ", ".join(available) if available else "none"
+        return (f"No {mode}/{graph} graph data for that request. Dates available: {avail}. "
+                "A sleep recording is dated by the evening it started.")
+    style = GRAPH_STYLES.get(f"{mode}/{graph}",
+                             "No style on file for this graph: plot its columns against time.")
+    parts = [f"{mode}/{graph}: {len(rows)} recording(s).", "", "HOW TO DRAW IT: " + style,
+             GRAPH_STYLE_COMMON, ""]
+    for start, text in rows:
+        parts += [f"=== Recording started {start} ===", text.strip(), ""]
+    return "\n".join(parts)
 
 
 def _tool_get_saved_variants(person: str, args: dict) -> str:
@@ -3501,6 +3757,24 @@ AI_TOOLS: dict[str, dict[str, Any]] = {
                       "description": "Optional: only variants from this imported group."}},
             "additionalProperties": False},
     },
+    "get_graph_data": {
+        "fn": _tool_get_graph_data,
+        "description": ("Data for redrawing one of the app's graphs (e.g. the sleep "
+                        "hypnogram) for one or more recordings, with instructions for how "
+                        "the app draws it. Use it whenever the user wants to see an app "
+                        "graph, or several nights stacked or side by side. list_my_data "
+                        "shows which graphs and dates exist."),
+        "schema": {"type": "object", "properties": {
+            "mode": {"type": "string", "description": "e.g. sleep, load, exertion, stand."},
+            "graph": {"type": "string",
+                      "description": "e.g. stages, heart_rate, cycling, timeline."},
+            "dates": {"type": "array", "items": {"type": "string"},
+                      "description": "Optional YYYY-MM-DD dates (up to 14). A sleep "
+                                     "recording is dated by the evening it started."},
+            "latest": {"type": "integer",
+                       "description": "If no dates: how many most recent recordings (1-14)."}},
+            "required": ["mode", "graph"], "additionalProperties": False},
+    },
     "save_note": {
         "fn": _tool_save_note,
         "description": ("Save a short note about this conversation (what was looked at, "
@@ -3524,7 +3798,7 @@ AI_INSTRUCTIONS = (
     "discussing a mode, read its guide section. Follow the guide's rules: research "
     "use only, no diagnosis, label metrics by what was measured, compare the user "
     "with their own history, and never describe how metrics are calculated. Use "
-    "get_session_history for the data and get_saved_variants for saved genomic variants. Offer to save a short note at the end of a "
+    "get_session_history for the data, get_graph_data to redraw the app's graphs, and get_saved_variants for saved genomic variants. Offer to save a short note at the end of a "
     "useful conversation."
 )
 
@@ -3586,6 +3860,9 @@ async def mcp_endpoint(key: str, request: Request):
     if not person:
         return JSONResponse(status_code=404,
                             content={"error": "Unknown or retired Vagis connector address."})
+    if person.startswith("VG-") and await asyncio.to_thread(_vg_tier, person) != "premium":
+        return JSONResponse(status_code=403,
+                            content={"error": "This Vagis connection needs a Premium plan."})
     try:
         body = await request.json()
     except Exception:
@@ -3732,3 +4009,201 @@ def help_chat(req: HelpRequest, authorization: str | None = Header(default=None)
     if device_id:
         _agent_record(device_id)
     return HelpResponse(reply=reply)
+
+
+# ==========================================================================
+# ADMIN — PEOPLE (VG codes)
+# ==========================================================================
+def _vg_tier(code: str) -> Optional[str]:
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            p = vg_person(cur, code)
+            return p["tier"] if p else None
+    finally:
+        conn.close()
+
+
+def _admin_ok(token: str) -> bool:
+    return bool(VAGIS_ADMIN_TOKEN) and token.strip() == VAGIS_ADMIN_TOKEN.strip()
+
+
+def _base_url(request: Request) -> str:
+    return str(request.base_url).rstrip("/").replace("http://", "https://")
+
+
+def _vg_active_key(cur, code: str) -> Optional[str]:
+    cur.execute("SELECT key FROM ai_connect_keys WHERE person_code = %s AND NOT revoked "
+                "ORDER BY created_at DESC LIMIT 1;", (code,))
+    r = cur.fetchone()
+    return r[0] if r else None
+
+
+def _vg_email_button(person: dict[str, Any], url: Optional[str]) -> str:
+    """mailto button with the person's code (and connector address if Premium)."""
+    if not person.get("email"):
+        return ""
+    name = person.get("name") or ""
+    lines = [f"Hi {name}," if name else "Hi,", "",
+             f"Your Vagis code: {person['code']}", "",
+             "Enter it in the Vagis app: Analysis > Data Share > type the code > Check > Send my data.",
+             "Send again after new recordings."]
+    if person["tier"] == "premium" and url:
+        lines += ["", "Your private Claude / ChatGPT connector address "
+                  "(keep it private, like a password):", url, "",
+                  "In Claude: Customize > Connectors > + > Add custom connector, "
+                  "name it Vagis and paste the address. Full steps are in the attached instructions."]
+    lines += ["", "Jason"]
+    return _mailto(person["email"], "Your Vagis code", "\n".join(lines), "Email this person")
+
+
+def _vg_result(person: dict[str, Any], url: Optional[str], extra: str = "") -> str:
+    rows = [("Name", _esc(person.get("name") or "") or "&mdash;"),
+            ("Vagis code", _esc(person["code"])),
+            ("Tier", person["tier"].capitalize())]
+    html = '<div class="result">' + "".join(
+        f'<div class="row"><span class="k">{k}</span><span class="v">{v}</span></div>'
+        for k, v in rows)
+    if url:
+        html += ('<div class="row"><span class="k">Connector address</span>'
+                 f'<span class="v" style="word-break:break-all">{_esc(url)}</span></div>')
+        if person["tier"] != "premium":
+            html += '<div class="warn">The connector address only works once the tier is Premium.</div>'
+    html += extra + _vg_email_button(person, url) + "</div>"
+    return html
+
+
+@app.post("/admin/ui/person/add", response_class=HTMLResponse)
+def admin_person_add(request: Request, token: str = Form(""), name: str = Form(""),
+                     email: str = Form(""), tier: str = Form("free"),
+                     old_code: str = Form("")) -> HTMLResponse:
+    if not _admin_ok(token):
+        return HTMLResponse(_admin_page(token, '<div class="err">Admin token did not match.</div>'))
+    tier = tier if tier in VG_TIERS else "free"
+    old = (old_code or "").strip().upper()
+    moved = ""
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _ai_ensure_tables(cur)
+            if old:
+                parsed = parse_person_code(old)
+                if not parsed:
+                    return HTMLResponse(_admin_page(token,
+                        '<div class="err">The old code isn\'t a valid SE or PT code.</div>'))
+                old = parsed["person_code"]
+                cur.execute("SELECT code FROM vagis_people WHERE legacy_code = %s;", (old,))
+                done = cur.fetchone()
+                if done:
+                    return HTMLResponse(_admin_page(token,
+                        f'<div class="err">{_esc(old)} was already moved to {_esc(done[0])}.</div>'))
+            code = make_vg_code()
+            while vg_person(cur, code):
+                code = make_vg_code()
+            cur.execute("INSERT INTO vagis_people (code, name, email, tier, legacy_code) "
+                        "VALUES (%s, %s, %s, %s, %s);",
+                        (code, name.strip() or None, email.strip() or None, tier, old or None))
+            if old:
+                cur.execute("UPDATE research_uploads SET person_code = %s WHERE person_code = %s;",
+                            (code, old))
+                n = cur.rowcount
+                cur.execute("UPDATE ai_notes SET person_code = %s WHERE person_code = %s;", (code, old))
+                cur.execute("UPDATE ai_connect_keys SET revoked = TRUE WHERE person_code = %s;", (old,))
+                moved = (f'<div class="warn">Moved {n} mode(s) of data from {_esc(old)}. '
+                         f'The old code\'s connector address no longer works.</div>')
+            key = _ai_issue_key(cur, code)
+            person = vg_person(cur, code)
+    finally:
+        conn.close()
+    url = f"{_base_url(request)}/mcp/{key}"
+    return HTMLResponse(_admin_page(token, _vg_result(person, url, moved)))
+
+
+def _people_table(request: Request, token: str) -> str:
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _ai_ensure_tables(cur)
+            cur.execute("SELECT code FROM vagis_people ORDER BY created_at DESC;")
+            codes = [r[0] for r in cur.fetchall()]
+            people = []
+            for c in codes:
+                p = vg_person(cur, c)
+                cur.execute("SELECT mode, uploaded_at FROM research_uploads WHERE person_code = %s "
+                            "ORDER BY mode;", (c,))
+                ups = cur.fetchall()
+                people.append((p, _vg_active_key(cur, c), ups))
+    finally:
+        conn.close()
+    if not people:
+        return '<p class="sub" style="margin-top:12px">No people yet.</p>'
+    tok = _esc(token)
+    base = _base_url(request)
+    rows = []
+    for p, key, ups in people:
+        url = f"{base}/mcp/{key}" if key else None
+        last = max((u[1] for u in ups), default=None)
+        data = (f"{len(ups)} mode(s), last sent {last.strftime('%Y-%m-%d')}" if ups else "no data yet")
+        opts = "".join(f'<option value="{t}"{" selected" if t == p["tier"] else ""}>{t.capitalize()}</option>'
+                       for t in VG_TIERS)
+        rows.append(f"""<tr>
+  <td><b>{_esc(p['code'])}</b><br><span class="sub">{_esc(p.get('name') or '')}</span></td>
+  <td>{_esc(p.get('email') or '')}<br><span class="sub">{data}</span></td>
+  <td>
+    <form method="post" action="/admin/ui/person/update" style="display:flex;gap:6px;align-items:center">
+      <input type="hidden" name="token" value="{tok}">
+      <input type="hidden" name="code" value="{_esc(p['code'])}">
+      <select name="tier" style="margin:0">{opts}</select>
+      <button type="submit" name="action" value="tier" class="secondary" style="margin:0;padding:6px 10px">Save</button>
+    </form>
+  </td>
+  <td>
+    <form method="post" action="/admin/ui/person/update">
+      <input type="hidden" name="token" value="{tok}">
+      <input type="hidden" name="code" value="{_esc(p['code'])}">
+      <button type="submit" name="action" value="show" class="secondary" style="margin:0;padding:6px 10px">Show / email</button>
+      <button type="submit" name="action" value="newkey" class="secondary" style="margin:4px 0 0;padding:6px 10px">New connector address</button>
+    </form>
+  </td>
+</tr>""")
+    return ('<div class="tablewrap" style="margin-top:12px"><table>'
+            '<tr><th>Code</th><th>Email / data</th><th>Tier</th><th></th></tr>'
+            + "".join(rows) + "</table></div>")
+
+
+@app.post("/admin/ui/people", response_class=HTMLResponse)
+def admin_people(request: Request, token: str = Form("")) -> HTMLResponse:
+    if not _admin_ok(token):
+        return HTMLResponse(_admin_page(token, '<div class="err">Admin token did not match.</div>'))
+    return HTMLResponse(_admin_page(token, people_html=_people_table(request, token)))
+
+
+@app.post("/admin/ui/person/update", response_class=HTMLResponse)
+def admin_person_update(request: Request, token: str = Form(""), code: str = Form(""),
+                        action: str = Form(""), tier: str = Form("")) -> HTMLResponse:
+    if not _admin_ok(token):
+        return HTMLResponse(_admin_page(token, '<div class="err">Admin token did not match.</div>'))
+    vg = parse_vg_code(code)
+    extra = ""
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _ai_ensure_tables(cur)
+            person = vg_person(cur, vg) if vg else None
+            if not person:
+                return HTMLResponse(_admin_page(token, '<div class="err">Unknown code.</div>'))
+            if action == "tier" and tier in VG_TIERS:
+                cur.execute("UPDATE vagis_people SET tier = %s WHERE code = %s;", (tier, vg))
+                person["tier"] = tier
+                extra = f'<div class="warn">Tier set to {tier.capitalize()}.</div>'
+            if action == "newkey":
+                key = _ai_issue_key(cur, vg)
+                extra = '<div class="warn">New connector address made. The previous one no longer works.</div>'
+            else:
+                key = _vg_active_key(cur, vg) or _ai_issue_key(cur, vg)
+    finally:
+        conn.close()
+    url = f"{_base_url(request)}/mcp/{key}"
+    return HTMLResponse(_admin_page(token, _vg_result(person, url, extra),
+                                    people_html=_people_table(request, token)))
