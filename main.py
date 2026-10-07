@@ -1341,9 +1341,10 @@ GRAPH_STYLES: dict[str, str] = {
         "Supine 2 #9AA7B4. Mark each phase's Time to Peak with a faint dashed drop line "
         "in its colour. Legend names only; put Time to Peak values beside the graph."),
     "quick_check/pulse": (
-        "Quick Check Finger Pulse. Columns: t_s (seconds from the start of the shown "
-        "stretch), pulse (the filtered pulse signal the app draws, already oriented), "
-        "beat_start (1 where a beat begins). Draw as a single smooth line #5AA6EE on a "
+        "Quick Check Finger Pulse. Given compactly: start_s, sample_rate_hz, pulse (evenly "
+        "spaced samples of the filtered pulse signal the app draws, already oriented; "
+        "sample i is at start_s + i / sample_rate_hz seconds) and beat_start_s (times "
+        "where beats begin). Interpolate smoothly (cubic) between samples. Draw as a single smooth line #5AA6EE on a "
         "black background with a small dot at each beat start. Each pulse's steeper "
         "slope must be its leading (upstroke) slope; the app has already oriented it "
         "that way, so do not flip it. No y-axis numbers; x-axis in seconds."),
@@ -1413,9 +1414,41 @@ def _tool_get_graph_data(person: str, args: dict) -> str:
                              "No style on file for this graph: plot its columns against time.")
     parts = [f"{mode}/{graph}: {len(rows)} recording(s).", "", "HOW TO DRAW IT: " + style,
              GRAPH_STYLE_COMMON, ""]
+    compact = COMPACT_GRAPHS.get(f"{mode}/{graph}")
     for start, text in rows:
-        parts += [f"=== Recording started {start} ===", text.strip(), ""]
+        body = compact(text) if compact else text.strip()
+        parts += [f"=== Recording started {start} ===", body, ""]
     return "\n".join(parts)
+
+
+def _compact_pulse(text: str, target_hz: float = 25.0) -> str:
+    """Quick Check pulse in a short form an agent can copy straight into its
+    plotting code: evenly spaced samples on one line (reduced to ~25 Hz, which
+    keeps the waveform's shape, notch included) plus the beat-start times at
+    full resolution."""
+    recs = list(csv.DictReader(io.StringIO(text)))
+    ts, ys, beats = [], [], []
+    for r in recs:
+        try:
+            t, y = float(r["t_s"]), float(r["pulse"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        ts.append(t); ys.append(y)
+        if (r.get("beat_start") or "0").strip() == "1":
+            beats.append(t)
+    if len(ts) < 2:
+        return text.strip()
+    dt = (ts[-1] - ts[0]) / (len(ts) - 1)
+    step = max(1, round((1.0 / target_hz) / dt)) if dt > 0 else 1
+    hz = 1.0 / (dt * step) if dt > 0 else target_hz
+    vals = ",".join(str(int(round(v))) for v in ys[::step])
+    return (f"start_s: {ts[0]:.2f}\nsample_rate_hz: {hz:g}\n"
+            f"pulse: {vals}\n"
+            f"beat_start_s: {','.join(f'{b:.2f}' for b in beats)}")
+
+
+# Graphs returned in a compact form instead of their raw CSV.
+COMPACT_GRAPHS = {"quick_check/pulse": _compact_pulse}
 
 
 def _tool_get_saved_variants(person: str, args: dict) -> str:
