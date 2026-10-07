@@ -1293,7 +1293,7 @@ GENOMICS_MODE = "genomics"
 # agent then just plots its columns against time.
 GRAPH_STYLE_COMMON = (
     "Draw on a black background with white/grey text, no chart junk. The time column "
-    "is local clock time (graphs with a freq_hz column use frequency instead). Label the x-axis with whole hours (hour number only for "
+    "is local clock time (graphs with a freq_hz, ms or t_s column use that instead). Label the x-axis with whole hours (hour number only for "
     "overnight graphs). When the user asks for several recordings, stack them one "
     "above the other sharing the same x-axis (align by clock time for sleep, by "
     "elapsed time otherwise) or place them side by side, as the user prefers, each "
@@ -1332,6 +1332,21 @@ GRAPH_STYLES: dict[str, str] = {
         "frequency in Hz (not time), 0 to 0.5 Hz; draw power as a filled curve #3B82F6. "
         "Mark the LF band 0.04-0.15 Hz and HF band 0.15-0.40 Hz; the tallest peak is "
         "the breathing frequency. Several sessions can be overlaid in one plot."),
+    "stand/waveform": (
+        "Stand Waveform Shape. Columns: phase (Supine or Supine 1, Standing, Supine 2), "
+        "ms (time from the pulse foot), shape (the averaged beat scaled 0-1), ttp_ms "
+        "(that phase's Time to Peak, blank if no clear peak). Overlay the phases on one "
+        "plot, x = ms from pulse foot, y = Pulse Shape 0-1 with no numbers on the axis. "
+        "Colours: Supine 1 #5AA6EE, Standing #3554C9 drawn thicker and on top, "
+        "Supine 2 #9AA7B4. Mark each phase's Time to Peak with a faint dashed drop line "
+        "in its colour. Legend names only; put Time to Peak values beside the graph."),
+    "quick_check/pulse": (
+        "Quick Check Finger Pulse. Columns: t_s (seconds from the start of the shown "
+        "stretch), pulse (the filtered pulse signal the app draws, already oriented), "
+        "beat_start (1 where a beat begins). Draw as a single smooth line #5AA6EE on a "
+        "black background with a small dot at each beat start. Each pulse's steeper "
+        "slope must be its leading (upstroke) slope; the app has already oriented it "
+        "that way, so do not flip it. No y-axis numbers; x-axis in seconds."),
     "stand/heart_rate": (
         "Stand test heart rate and motion. Columns: time, hr (bpm), phase (Supine or "
         "Supine 1, Standing, Supine 2), motion (the app's accel score). HR as a line "
