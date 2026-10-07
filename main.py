@@ -3511,7 +3511,7 @@ GENOMICS_MODE = "genomics"
 # agent then just plots its columns against time.
 GRAPH_STYLE_COMMON = (
     "Draw on a black background with white/grey text, no chart junk. The time column "
-    "is local clock time. Label the x-axis with whole hours (hour number only for "
+    "is local clock time (graphs with a freq_hz column use frequency instead). Label the x-axis with whole hours (hour number only for "
     "overnight graphs). When the user asks for several recordings, stack them one "
     "above the other sharing the same x-axis (align by clock time for sleep, by "
     "elapsed time otherwise) or place them side by side, as the user prefers, each "
@@ -3542,10 +3542,21 @@ GRAPH_STYLES: dict[str, str] = {
     "exertion/heart_rate": (
         "Exertion heart rate. Columns: time, hr (bpm), from the ring's stored HR. "
         "Line #3B82F6, y-axis in bpm."),
+    "breathwork/heart_rate": (
+        "Breathwork heart rate (tachogram). Columns: time, hr (bpm), one row per beat. "
+        "Line #3B82F6; paced breathing shows as regular waves in HR."),
+    "breathwork/spectrum": (
+        "Breathwork breathing spectrum. Columns: freq_hz, power. The x-axis is "
+        "frequency in Hz (not time), 0 to 0.5 Hz; draw power as a filled curve #3B82F6. "
+        "Mark the LF band 0.04-0.15 Hz and HF band 0.15-0.40 Hz; the tallest peak is "
+        "the breathing frequency. Several sessions can be overlaid in one plot."),
     "stand/heart_rate": (
-        "Stand test heart rate. Columns: time, hr (bpm), phase (Supine 1, Standing, "
-        "Supine 2). Line #3B82F6; shade or label each phase band behind the line; the "
-        "standing cue is where phase changes to Standing."),
+        "Stand test heart rate and motion. Columns: time, hr (bpm), phase (Supine or "
+        "Supine 1, Standing, Supine 2), motion (the app's accel score). HR as a line "
+        "#3B82F6 in an upper panel, motion as a thin trace in a short panel below "
+        "sharing the time axis; shade or label each phase band behind both; the "
+        "standing cue is where phase changes to Standing. Exertion has no motion data: "
+        "the ring's stored HR carries none."),
 }
 
 
