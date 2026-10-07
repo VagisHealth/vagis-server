@@ -3519,10 +3519,12 @@ GRAPH_STYLE_COMMON = (
 )
 GRAPH_STYLES: dict[str, str] = {
     "sleep/stages": (
-        "Sleep Stages hypnogram. Columns: time, stage (Wake, REM, Light, Deep), one row "
-        "per 30 s. Draw as a stepped hypnogram with rows top to bottom Wake, REM, Light, "
-        "Deep; colour each segment by stage: Wake #FFFFFF, REM #5AA6EE, Light #3554C9, "
-        "Deep #4FDBFF."),
+        "Sleep Stages hypnogram. Columns: time, stage (Awake, REM, Light, Deep), one row "
+        "per 30 s. Draw it as the app does: four horizontal lanes, top to bottom Awake, "
+        "REM, Light, Deep, with a filled bar in a stage's lane for every stretch spent in "
+        "it (thin connectors between lanes are optional). Colours: Awake #FFFFFF, REM "
+        "#5AA6EE, Light #3554C9, Deep #4FDBFF. Beside each lane label you may show that "
+        "stage's percentage of the night."),
     "sleep/heart_rate": (
         "Overnight heart rate. Columns: time, hr (bpm). Line #3B82F6, y-axis in bpm."),
     "sleep/cycling": (
