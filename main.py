@@ -1806,8 +1806,8 @@ def _vg_email_button(person: dict[str, Any], url: Optional[str]) -> str:
     name = person.get("name") or ""
     lines = [f"Hi {name}," if name else "Hi,", "",
              f"Your Vagis code: {person['code']}", "",
-             "Enter it in the Vagis app: Analysis > Data Share > type the code > Check > Send my data.",
-             "Send again after new recordings."]
+             "Enter it in the Vagis app: Analysis > Data Share > type the code > Check > Start sharing.",
+             "After that your data is sent automatically after each recording."]
     if person["tier"] == "premium" and url:
         lines += ["", "Your private Claude / ChatGPT connector address "
                   "(keep it private, like a password):", url, "",
