@@ -184,7 +184,13 @@ def db_connect():
     if not DATABASE_URL:
         raise HTTPException(status_code=500, detail="Database not configured.")
     try:
-        return psycopg2.connect(DATABASE_URL)
+        # Time limits so a request can never hang: give up waiting for a lock
+        # after 8 s, stop any query after 30 s, and end any session left idle
+        # inside a transaction after 60 s (which would otherwise hold locks).
+        return psycopg2.connect(
+            DATABASE_URL, connect_timeout=10,
+            options="-c lock_timeout=8000 -c statement_timeout=30000 "
+                    "-c idle_in_transaction_session_timeout=60000")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Database connection failed: {type(e).__name__}")
 
@@ -201,9 +207,13 @@ def init_db() -> None:
     if not DATABASE_URL:
         return
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = db_connect()
         with conn, conn.cursor() as cur:
             ensure_tables(cur)
+        conn.close()
+        conn = db_connect()
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
         conn.close()
     except Exception as e:
         print(f"[startup] db init failed: {type(e).__name__}: {e}")
@@ -2087,7 +2097,17 @@ CREATE TABLE IF NOT EXISTS vagis_study_researchers (
 """
 
 
+_STUDY_SCHEMA_READY = False
+
+
 def _study_ensure(cur) -> None:
+    """Study tables and the one-link migration. Runs its table changes ONCE per
+    server start (normally at startup): changing a table needs an exclusive
+    lock, and doing that on every request made requests queue behind each
+    other and freeze the pages."""
+    global _STUDY_SCHEMA_READY
+    if _STUDY_SCHEMA_READY:
+        return
     _ai_ensure_tables(cur)
     cur.execute(CREATE_STUDIES_SQL)
     cur.execute(STUDY_MIGRATE_SQL)
@@ -2105,6 +2125,7 @@ def _study_ensure(cur) -> None:
                     "SELECT study_id, researcher, email FROM vagis_study_access "
                     "WHERE study_id = %s AND NOT revoked ORDER BY created_at;", (sid,))
         cur.execute("UPDATE vagis_study_access SET revoked = TRUE WHERE study_id = %s;", (sid,))
+    _STUDY_SCHEMA_READY = True
 
 
 def _study_for_key(key: str) -> Optional[dict[str, Any]]:
@@ -2702,11 +2723,11 @@ def study_do(request: Request, key: str, action: str = Form(""), name: str = For
 
 
 # ---- Admin: studies (Vagis only) -------------------------------------------
-async def _read_logo(logo: Optional[UploadFile]) -> tuple[Optional[bytes], Optional[str], str]:
+def _read_logo(logo: Optional[UploadFile]) -> tuple[Optional[bytes], Optional[str], str]:
     """(bytes, type, error). No file -> (None, None, "")."""
     if logo is None or not logo.filename:
         return None, None, ""
-    data = await logo.read()
+    data = logo.file.read(LOGO_MAX_BYTES + 1)
     if not data:
         return None, None, ""
     if logo.content_type not in LOGO_TYPES:
@@ -2772,7 +2793,7 @@ def admin_studies(request: Request, token: str = Form("")) -> HTMLResponse:
 
 
 @app.post("/admin/ui/study/add", response_class=HTMLResponse)
-async def admin_study_add(request: Request, token: str = Form(""), name: str = Form(""),
+def admin_study_add(request: Request, token: str = Form(""), name: str = Form(""),
                           lead_name: str = Form(""), lead_email: str = Form(""),
                           logo: Optional[UploadFile] = File(None)) -> HTMLResponse:
     if not _admin_ok(token):
@@ -2780,7 +2801,7 @@ async def admin_study_add(request: Request, token: str = Form(""), name: str = F
     name = name.strip()
     if not name:
         return _studies_page(request, token, '<div class="err">Give the study a name.</div>')
-    data, ctype, err = await _read_logo(logo)
+    data, ctype, err = _read_logo(logo)
     if err:
         return _studies_page(request, token, f'<div class="err">{err}</div>')
     conn = db_connect()
@@ -2803,12 +2824,12 @@ async def admin_study_add(request: Request, token: str = Form(""), name: str = F
 
 
 @app.post("/admin/ui/study/update", response_class=HTMLResponse)
-async def admin_study_update(request: Request, token: str = Form(""), study_id: int = Form(0),
+def admin_study_update(request: Request, token: str = Form(""), study_id: int = Form(0),
                              lead_name: str = Form(""), lead_email: str = Form(""),
                              logo: Optional[UploadFile] = File(None)) -> HTMLResponse:
     if not _admin_ok(token):
         return HTMLResponse(_admin_page(token, '<div class="err">Admin token did not match.</div>'))
-    data, ctype, err = await _read_logo(logo)
+    data, ctype, err = _read_logo(logo)
     if err:
         return _studies_page(request, token, f'<div class="err">{err}</div>')
     conn = db_connect()
