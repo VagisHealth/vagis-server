@@ -13,7 +13,10 @@ Endpoints:
   POST /mcp/{key}              -- personal Claude/ChatGPT connector (Premium only)
   POST /help/chat              -- in-app Vagis Help (guide only, no user data)
   POST /chat                   -- old in-app agent relay (no longer used by the app)
-  GET  /admin                  -- add people, set tiers, connector addresses
+  GET  /admin                  -- add people, set tiers, connector addresses, studies
+  POST /mcp/study/{key}        -- a researcher's study connector (all subjects in the study)
+  GET  /study/{key}            -- a researcher's download page
+  GET  /study/{key}/download   -- zip of the study's data
 """
 
 from __future__ import annotations
@@ -759,7 +762,8 @@ def _mailto(email: str, subject: str, body: str, text: str) -> str:
 
 
 # ---- Admin page ----------------------------------------------------------
-def _admin_page(token: str = "", banner: str = "", people_html: str = "") -> str:
+def _admin_page(token: str = "", banner: str = "", people_html: str = "",
+                studies_html: str = "") -> str:
     tok = _esc(token)
     tier_opts = "".join(f'<option value="{t}">{t.capitalize()}</option>' for t in VG_TIERS)
     return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
@@ -791,6 +795,20 @@ def _admin_page(token: str = "", banner: str = "", people_html: str = "") -> str
       <button type="submit" class="secondary">Show people</button>
     </form>
     {people_html}
+  </div>
+  <div class="card">
+    <h2>Studies</h2>
+    <p class="sub">A study groups Vagis codes. Each researcher gets a study connector address
+    (shows everyone in the study in Claude/ChatGPT) and a download page.</p>
+    <form method="post" action="/admin/ui/study/add">
+      <label>Admin token</label>
+      <input name="token" type="password" placeholder="Your VAGIS_ADMIN_TOKEN" value="{tok}" autocomplete="off">
+      <label>New study name</label>
+      <input name="name" type="text" placeholder="Jason research">
+      <button type="submit">Add study</button>
+      <button type="submit" formaction="/admin/ui/studies" class="secondary">Show studies</button>
+    </form>
+    {studies_html}
   </div>
 </body></html>"""
 
@@ -1990,3 +2008,557 @@ def admin_person_update(request: Request, token: str = Form(""), code: str = For
     url = f"{_base_url(request)}/mcp/{key}"
     return HTMLResponse(_admin_page(token, _vg_result(person, url, extra),
                                     people_html=_people_table(request, token)))
+
+
+# ==========================================================================
+# STUDIES — researchers see the data of every code linked to their study
+# ==========================================================================
+# A study is a name plus a list of linked Vagis codes. A subject needs nothing
+# but their code with sharing on in the app (Free is fine). Each researcher on
+# a study gets one private key, used for:
+#     POST /mcp/study/<key>       study connector for Claude / ChatGPT
+#     GET  /study/<key>           download page
+#     GET  /study/<key>/download  zip of all the study's data
+# A subject linked to several studies is visible to each. Unlinking removes
+# them from that study at once; their data stays under their own code.
+import zipfile as _zipfile
+
+CREATE_STUDIES_SQL = """
+CREATE TABLE IF NOT EXISTS vagis_studies (
+    id           SERIAL PRIMARY KEY,
+    name         TEXT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS vagis_study_members (
+    study_id     INTEGER NOT NULL,
+    person_code  TEXT NOT NULL,
+    label        TEXT,
+    added_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (study_id, person_code)
+);
+CREATE TABLE IF NOT EXISTS vagis_study_access (
+    key          TEXT PRIMARY KEY,
+    study_id     INTEGER NOT NULL,
+    researcher   TEXT,
+    email        TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked      BOOLEAN NOT NULL DEFAULT FALSE
+);
+"""
+
+
+def _study_ensure(cur) -> None:
+    _ai_ensure_tables(cur)
+    cur.execute(CREATE_STUDIES_SQL)
+
+
+def _study_for_key(key: str) -> Optional[dict[str, Any]]:
+    if not key or not DATABASE_URL:
+        return None
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
+            cur.execute("SELECT s.id, s.name, a.researcher FROM vagis_study_access a "
+                        "JOIN vagis_studies s ON s.id = a.study_id "
+                        "WHERE a.key = %s AND NOT a.revoked;", (key,))
+            r = cur.fetchone()
+            return {"id": r[0], "name": r[1], "researcher": r[2]} if r else None
+    finally:
+        conn.close()
+
+
+def _study_members(cur, study_id: int) -> list[tuple[str, str]]:
+    """[(code, display name)] — display name is the label, else the code."""
+    cur.execute("SELECT person_code, label FROM vagis_study_members WHERE study_id = %s "
+                "ORDER BY added_at, person_code;", (study_id,))
+    return [(c, (l or "").strip() or c) for c, l in cur.fetchall()]
+
+
+def _subject_id(m: tuple[str, str]) -> str:
+    code, disp = m
+    return code if disp == code else f"{disp} ({code})"
+
+
+def _study_find(cur, study_id: int, subject: str) -> Optional[str]:
+    """Subject given as code or label -> code, if in this study."""
+    want = (subject or "").strip()
+    vg = parse_vg_code(want)
+    for code, disp in _study_members(cur, study_id):
+        if code == vg or disp.lower() == want.lower():
+            return code
+    return None
+
+
+def _merge_csvs(parts: list[tuple[str, str]]) -> tuple[str, int]:
+    """[(subject, csv_text)] -> one CSV with a leading subject column. Columns are
+    the union across subjects (app versions can differ), in first-seen order."""
+    cols: list[str] = []
+    rows: list[dict] = []
+    for subj, text in parts:
+        rd = csv.DictReader(io.StringIO(text))
+        for c in rd.fieldnames or []:
+            if c not in cols:
+                cols.append(c)
+        for r in rd:
+            r = {k: v for k, v in r.items() if k is not None}
+            r["subject"] = subj
+            rows.append(r)
+    out = io.StringIO()
+    w = csv.DictWriter(out, fieldnames=["subject"] + cols, lineterminator="\n",
+                       extrasaction="ignore")
+    w.writeheader()
+    w.writerows(rows)
+    return out.getvalue(), len(rows)
+
+
+# ---- Study connector tools -----------------------------------------------
+def _st_list_subjects(study: dict, args: dict) -> str:
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
+            members = _study_members(cur, study["id"])
+            lines = [f"Study: {study['name']}. {len(members)} subject(s)."]
+            for m in members:
+                code = m[0]
+                cur.execute("SELECT mode, row_count, uploaded_at FROM research_uploads "
+                            "WHERE person_code = %s AND mode <> %s ORDER BY mode;",
+                            (code, GENOMICS_MODE))
+                ups = cur.fetchall()
+                cur.execute("SELECT mode, graph, COUNT(*), MIN(local_start), MAX(local_start) "
+                            "FROM vagis_timelines WHERE person_code = %s "
+                            "GROUP BY mode, graph ORDER BY mode, graph;", (code,))
+                gr = cur.fetchall()
+                lines.append(f"\n## {_subject_id(m)}")
+                if not ups and not gr:
+                    lines.append("No data yet (sharing not started in the app).")
+                    continue
+                for mode, n, up in ups:
+                    lines.append(f"- {mode}: {n} recording(s), last sent "
+                                 f"{up.strftime('%Y-%m-%d %H:%M UTC') if up else '?'}")
+                if gr:
+                    lines.append("  graph data: " + "; ".join(
+                        f"{mo}/{g} {n} ({lo[:10]} to {hi[:10]})" for mo, g, n, lo, hi in gr))
+    finally:
+        conn.close()
+    return "\n".join(lines)
+
+
+def _st_subject_history(study: dict, args: dict) -> str:
+    mode = (args.get("mode") or "").strip().lower()
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
+            code = _study_find(cur, study["id"], args.get("subject") or "")
+            if not code:
+                return "That subject is not in this study. Call list_subjects."
+            if not mode:
+                return "Give a mode, e.g. sleep, stand, exertion, load, breathwork or quick_check."
+            return _tool_get_session_history(code, args)
+    finally:
+        conn.close()
+
+
+def _st_group_history(study: dict, args: dict) -> str:
+    mode = (args.get("mode") or "").strip().lower()
+    if not mode:
+        return "Give a mode, e.g. sleep, stand, exertion, load, breathwork or quick_check."
+    last_n = args.get("last_n")
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
+            parts = []
+            for m in _study_members(cur, study["id"]):
+                cur.execute("SELECT csv_text FROM research_uploads "
+                            "WHERE person_code = %s AND mode = %s;", (m[0], mode))
+                r = cur.fetchone()
+                if r:
+                    text = r[0]
+                    if isinstance(last_n, int) and last_n > 0:
+                        ls = text.strip().splitlines()
+                        text = "\n".join([ls[0]] + ls[1:][-last_n:]) if ls else text
+                    parts.append((m[1], text))
+    finally:
+        conn.close()
+    if not parts:
+        return f"No subject in this study has {mode} Session History yet."
+    merged, n = _merge_csvs(parts)
+    return (f"{mode} Session History for {len(parts)} subject(s), {n} recording(s) "
+            "(CSV, one row per recording; the subject column says whose). Column names "
+            "are the app's file headers; the guide gives the names the user sees.\n\n" + merged)
+
+
+def _st_graph_data(study: dict, args: dict) -> str:
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
+            code = _study_find(cur, study["id"], args.get("subject") or "")
+    finally:
+        conn.close()
+    if not code:
+        return "That subject is not in this study. Call list_subjects."
+    return _tool_get_graph_data(code, args)
+
+
+def _st_guide(study: dict, args: dict) -> str:
+    return _tool_get_vagis_guide("", args)
+
+
+def _st_save_note(study: dict, args: dict) -> str:
+    return _tool_save_note(f"STUDY-{study['id']}", args)
+
+
+def _st_get_notes(study: dict, args: dict) -> str:
+    return _tool_get_notes(f"STUDY-{study['id']}", args)
+
+
+_SUBJ = {"type": "string", "description": "Subject name or Vagis code, as list_subjects shows it."}
+STUDY_TOOLS: dict[str, dict[str, Any]] = {
+    "get_vagis_guide": {**AI_TOOLS["get_vagis_guide"], "fn": _st_guide},
+    "list_subjects": {
+        "fn": _st_list_subjects,
+        "description": ("Everyone in this study, and for each: which modes have Session "
+                        "History, how many recordings, when last sent, and which graph "
+                        "data exists. Call this first."),
+        "schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    "get_subject_history": {
+        "fn": _st_subject_history,
+        "description": "One subject's Session History for one mode, as CSV (one row per recording).",
+        "schema": {"type": "object", "properties": {
+            "subject": _SUBJ,
+            "mode": {"type": "string", "description": "e.g. sleep, stand, exertion, load, breathwork, quick_check."},
+            "last_n": {"type": "integer", "minimum": 1, "description": "Optional: only the most recent N."}},
+            "required": ["subject", "mode"], "additionalProperties": False},
+    },
+    "get_group_history": {
+        "fn": _st_group_history,
+        "description": ("One mode's Session History for every subject in the study, as one "
+                        "CSV with a subject column. Use it to compare subjects or run group "
+                        "statistics."),
+        "schema": {"type": "object", "properties": {
+            "mode": {"type": "string", "description": "e.g. sleep, stand, exertion, load, breathwork, quick_check."},
+            "last_n": {"type": "integer", "minimum": 1,
+                       "description": "Optional: only each subject's most recent N."}},
+            "required": ["mode"], "additionalProperties": False},
+    },
+    "get_graph_data": {
+        "fn": _st_graph_data,
+        "description": ("Data for redrawing one of the app's graphs (e.g. the sleep "
+                        "hypnogram) for one subject, one or more recordings, with "
+                        "instructions for how the app draws it. Call once per subject "
+                        "to show several subjects."),
+        "schema": {"type": "object", "properties": {
+            "subject": _SUBJ,
+            **AI_TOOLS["get_graph_data"]["schema"]["properties"]},
+            "required": ["subject", "mode", "graph"], "additionalProperties": False},
+    },
+    "save_note": {**AI_TOOLS["save_note"], "fn": _st_save_note,
+                  "description": ("Save a short note about this study conversation so later "
+                                  "conversations can pick up from it. Ask before saving.")},
+    "get_notes": {**AI_TOOLS["get_notes"], "fn": _st_get_notes,
+                  "description": "Notes saved from earlier conversations about this study, newest first."},
+}
+
+STUDY_INSTRUCTIONS = (
+    "Vagis study connector: Vagis smart-ring metrics for every subject in one research "
+    "study. At the start call get_vagis_guide (overview and rules), get_notes and "
+    "list_subjects. Read a mode's guide section before discussing it. Follow the guide's "
+    "rules (research use only, no diagnosis, metric names as measured, never describe how "
+    "metrics are calculated). 'The user' in the guide means the subject. Use "
+    "get_subject_history or get_group_history for the data and get_graph_data to redraw "
+    "the app's graphs."
+)
+
+
+def _study_mcp_handle(study: dict, msg: Any) -> Optional[dict]:
+    if not isinstance(msg, dict):
+        return _rpc_error(None, -32600, "Invalid request")
+    method, msg_id = msg.get("method"), msg.get("id")
+    if msg_id is None:
+        return None
+    params = msg.get("params") or {}
+    if method == "initialize":
+        asked = params.get("protocolVersion")
+        return _rpc_result(msg_id, {
+            "protocolVersion": asked if asked in MCP_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSIONS[0],
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "vagis-study", "title": f"Vagis study: {study['name']}",
+                           "version": "1.0.0"},
+            "instructions": STUDY_INSTRUCTIONS,
+        })
+    if method == "ping":
+        return _rpc_result(msg_id, {})
+    if method == "tools/list":
+        return _rpc_result(msg_id, {"tools": [
+            {"name": n, "description": t["description"], "inputSchema": t["schema"]}
+            for n, t in STUDY_TOOLS.items()]})
+    if method == "tools/call":
+        name = params.get("name")
+        tool = STUDY_TOOLS.get(name)
+        if not tool:
+            return _rpc_error(msg_id, -32602, f"Unknown tool: {name}")
+        args = params.get("arguments") or {}
+        try:
+            text = tool["fn"](study, args if isinstance(args, dict) else {})
+            return _rpc_result(msg_id, {"content": [{"type": "text", "text": text}],
+                                        "isError": False})
+        except Exception as e:
+            print(f"[study] tool {name} failed: {type(e).__name__}: {e}")
+            return _rpc_result(msg_id, {"content": [{"type": "text",
+                               "text": "The Vagis server could not complete that request."}],
+                               "isError": True})
+    return _rpc_error(msg_id, -32601, f"Method not found: {method}")
+
+
+@app.post("/mcp/study/{key}")
+async def study_mcp_endpoint(key: str, request: Request):
+    study = await asyncio.to_thread(_study_for_key, key)
+    if not study:
+        return JSONResponse(status_code=404,
+                            content={"error": "Unknown or retired Vagis study address."})
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content=_rpc_error(None, -32700, "Parse error"))
+    if isinstance(body, list):
+        replies = [r for r in [await asyncio.to_thread(_study_mcp_handle, study, m) for m in body] if r]
+        return JSONResponse(replies) if replies else Response(status_code=202)
+    reply = await asyncio.to_thread(_study_mcp_handle, study, body)
+    return JSONResponse(reply) if reply else Response(status_code=202)
+
+
+@app.get("/mcp/study/{key}")
+def study_mcp_get(key: str):
+    return Response(status_code=405, headers={"Allow": "POST"})
+
+
+# ---- Plain download --------------------------------------------------------
+def _study_zip(study: dict) -> bytes:
+    """session_history/<mode>.csv  — all subjects, subject column first
+       graph_data/<subject>/<mode>__<graph>__<start>.csv — one file per recording
+       subjects.csv"""
+    buf = io.BytesIO()
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur, _zipfile.ZipFile(buf, "w", _zipfile.ZIP_DEFLATED) as z:
+            _study_ensure(cur)
+            members = _study_members(cur, study["id"])
+            by_mode: dict[str, list[tuple[str, str]]] = {}
+            subj_rows = ["subject,vagis_code"]
+            for code, disp in members:
+                subj_rows.append(f'"{disp}",{code}')
+                cur.execute("SELECT mode, csv_text FROM research_uploads "
+                            "WHERE person_code = %s AND mode <> %s;", (code, GENOMICS_MODE))
+                for mode, text in cur.fetchall():
+                    by_mode.setdefault(mode, []).append((disp, text))
+                cur.execute("SELECT mode, graph, local_start, csv_text FROM vagis_timelines "
+                            "WHERE person_code = %s ORDER BY local_start;", (code,))
+                safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in disp)
+                for mode, graph, start, text in cur.fetchall():
+                    st = "".join(ch for ch in start if ch.isalnum() or ch in "-T")[:30]
+                    z.writestr(f"graph_data/{safe}/{mode}__{graph}__{st}.csv", text)
+            z.writestr("subjects.csv", "\n".join(subj_rows) + "\n")
+            for mode, parts in sorted(by_mode.items()):
+                z.writestr(f"session_history/{mode}.csv", _merge_csvs(parts)[0])
+    finally:
+        conn.close()
+    return buf.getvalue()
+
+
+@app.get("/study/{key}/download")
+def study_download(key: str):
+    study = _study_for_key(key)
+    if not study:
+        return HTMLResponse("<p>Unknown or retired study link.</p>", status_code=404)
+    fname = "".join(ch if ch.isalnum() else "_" for ch in study["name"]).strip("_") or "study"
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return Response(_study_zip(study), media_type="application/zip",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="vagis_{fname}_{stamp}.zip"'})
+
+
+@app.get("/study/{key}", response_class=HTMLResponse)
+def study_page(key: str) -> HTMLResponse:
+    study = _study_for_key(key)
+    if not study:
+        return HTMLResponse("<p>Unknown or retired study link.</p>", status_code=404)
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
+            rows = []
+            for code, disp in _study_members(cur, study["id"]):
+                cur.execute("SELECT mode, row_count, uploaded_at FROM research_uploads "
+                            "WHERE person_code = %s AND mode <> %s ORDER BY mode;",
+                            (code, GENOMICS_MODE))
+                ups = cur.fetchall()
+                last = max((u[2] for u in ups if u[2]), default=None)
+                modes = ", ".join(f"{m} ({n})" for m, n, _ in ups) or "no data yet"
+                rows.append(f"<tr><td><b>{_esc(disp)}</b><br><span class='muted'>{_esc(code)}</span></td>"
+                            f"<td style='white-space:normal'>{_esc(modes)}</td>"
+                            f"<td>{last.strftime('%Y-%m-%d') if last else '&mdash;'}</td></tr>")
+    finally:
+        conn.close()
+    table = ("<div class='tablewrap'><table><tr><th>Subject</th><th>Recordings</th><th>Last sent</th></tr>"
+             + "".join(rows) + "</table></div>") if rows else "<p class='sub'>No subjects linked yet.</p>"
+    return HTMLResponse(f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vagis study</title>{_style()}</head><body>
+  <h1>{_esc(study['name'])}</h1>
+  <p class="sub">Vagis study data{(' &middot; ' + _esc(study['researcher'])) if study['researcher'] else ''}</p>
+  <div class="card">
+    <h2>Download</h2>
+    <p class="sub">One zip: a Session History CSV per mode with every subject (subject column first),
+    plus each recording's graph data in graph_data/&lt;subject&gt;/.</p>
+    <a href="/study/{_esc(key)}/download" style="display:inline-block;padding:10px 18px;background:#0f6e56;
+       color:#fff;border-radius:8px;text-decoration:none;font-weight:500">Download all data (.zip)</a>
+  </div>
+  <div class="card"><h2>Subjects</h2>{table}</div>
+</body></html>""")
+
+
+# ---- Admin: studies --------------------------------------------------------
+def _studies_html(request: Request, token: str) -> str:
+    base = _base_url(request)
+    tok = _esc(token)
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
+            cur.execute("SELECT id, name FROM vagis_studies ORDER BY created_at DESC;")
+            studies = cur.fetchall()
+            blocks = []
+            for sid, sname in studies:
+                members = _study_members(cur, sid)
+                cur.execute("SELECT key, researcher, email FROM vagis_study_access "
+                            "WHERE study_id = %s AND NOT revoked ORDER BY created_at;", (sid,))
+                access = cur.fetchall()
+                hidden = (f'<input type="hidden" name="token" value="{tok}">'
+                          f'<input type="hidden" name="study_id" value="{sid}">')
+                mem_rows = "".join(
+                    f'<div class="subrow"><span><b>{_esc(disp)}</b> '
+                    f'<span class="muted mono">{_esc(code) if disp != code else ""}</span></span>'
+                    f'<form class="inline" method="post" action="/admin/ui/study/update">{hidden}'
+                    f'<input type="hidden" name="code" value="{_esc(code)}">'
+                    f'<button class="small secondary" name="action" value="unlink">Unlink</button></form></div>'
+                    for code, disp in members) or '<p class="muted">No codes linked yet.</p>'
+                acc_rows = ""
+                for key, who, email in access:
+                    mcp = f"{base}/mcp/study/{key}"
+                    page = f"{base}/study/{key}"
+                    body = "\n".join([
+                        f"Hi {who}," if who else "Hi,", "",
+                        f"Your Vagis study connection for \"{sname}\".", "",
+                        "1. Study connector address (keep it private, like a password):", mcp, "",
+                        "In Claude: Customize > Connectors > + > Add custom connector, name it "
+                        f"\"Vagis {sname}\" and paste the address. In a chat, ask e.g. "
+                        "\"list the subjects in my Vagis study\".", "",
+                        "2. Download page (all data as CSV files in a zip):", page, "", "Jason"])
+                    mail = _mailto(email or "", f"Vagis study: {sname}", body, "Email researcher") if email else ""
+                    acc_rows += (f'<div style="padding:10px 0;border-bottom:1px solid #f0f0f0">'
+                                 f'<b>{_esc(who or "Researcher")}</b> <span class="muted">{_esc(email or "")}</span>'
+                                 f'<div class="mono" style="font-size:12px;word-break:break-all;margin-top:6px">'
+                                 f'Connector: {_esc(mcp)}<br>Download page: {_esc(page)}</div>'
+                                 f'<form class="inline" method="post" action="/admin/ui/study/update">{hidden}'
+                                 f'<input type="hidden" name="key" value="{_esc(key)}">'
+                                 f'<button class="small secondary" name="action" value="revoke" '
+                                 f'style="margin-top:8px">Remove access</button></form> {mail}</div>')
+                if not acc_rows:
+                    acc_rows = '<p class="muted">No researchers yet.</p>'
+                blocks.append(f"""
+<div style="border:1px solid #e4e4e4;border-radius:10px;padding:16px;margin-top:16px">
+  <h2 style="margin-bottom:6px">{_esc(sname)} <span class="pill">{len(members)} subject(s)</span></h2>
+  <h2 style="font-size:14px;margin:14px 0 4px">Subjects</h2>
+  {mem_rows}
+  <form method="post" action="/admin/ui/study/update" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+    {hidden}
+    <div style="flex:1;min-width:150px"><label>Vagis code</label><input name="code" placeholder="VG-XXXX-XXXX"></div>
+    <div style="flex:1;min-width:150px"><label>Name in study (optional)</label><input name="label" placeholder="Dana or S01"></div>
+    <button name="action" value="link" style="margin:0">Link code</button>
+  </form>
+  <h2 style="font-size:14px;margin:18px 0 4px">Researchers</h2>
+  {acc_rows}
+  <form method="post" action="/admin/ui/study/update" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+    {hidden}
+    <div style="flex:1;min-width:150px"><label>Researcher name</label><input name="label" placeholder="Jason"></div>
+    <div style="flex:1;min-width:150px"><label>Email</label><input name="email" placeholder="name@example.com"></div>
+    <button name="action" value="addresearcher" style="margin:0">Add researcher</button>
+  </form>
+</div>""")
+    finally:
+        conn.close()
+    return "".join(blocks) or '<p class="sub" style="margin-top:12px">No studies yet.</p>'
+
+
+def _studies_page(request: Request, token: str, banner: str = "") -> HTMLResponse:
+    return HTMLResponse(_admin_page(token, banner, studies_html=_studies_html(request, token)))
+
+
+@app.post("/admin/ui/studies", response_class=HTMLResponse)
+def admin_studies(request: Request, token: str = Form(""), name: str = Form("")) -> HTMLResponse:
+    if not _admin_ok(token):
+        return HTMLResponse(_admin_page(token, '<div class="err">Admin token did not match.</div>'))
+    return _studies_page(request, token)
+
+
+@app.post("/admin/ui/study/add", response_class=HTMLResponse)
+def admin_study_add(request: Request, token: str = Form(""), name: str = Form("")) -> HTMLResponse:
+    if not _admin_ok(token):
+        return HTMLResponse(_admin_page(token, '<div class="err">Admin token did not match.</div>'))
+    name = name.strip()
+    if not name:
+        return _studies_page(request, token, '<div class="err">Give the study a name.</div>')
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
+            cur.execute("INSERT INTO vagis_studies (name) VALUES (%s);", (name,))
+    finally:
+        conn.close()
+    return _studies_page(request, token,
+                         f'<div class="result">Study &ldquo;{_esc(name)}&rdquo; added. '
+                         'Link codes and add researchers below.</div>')
+
+
+@app.post("/admin/ui/study/update", response_class=HTMLResponse)
+def admin_study_update(request: Request, token: str = Form(""), study_id: int = Form(0),
+                       action: str = Form(""), code: str = Form(""), label: str = Form(""),
+                       email: str = Form(""), key: str = Form("")) -> HTMLResponse:
+    if not _admin_ok(token):
+        return HTMLResponse(_admin_page(token, '<div class="err">Admin token did not match.</div>'))
+    banner = ""
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
+            if action == "link":
+                vg = parse_vg_code(code)
+                if not vg or not vg_person(cur, vg):
+                    banner = '<div class="err">That is not a Vagis code on this server.</div>'
+                else:
+                    cur.execute("INSERT INTO vagis_study_members (study_id, person_code, label) "
+                                "VALUES (%s, %s, %s) ON CONFLICT (study_id, person_code) "
+                                "DO UPDATE SET label = EXCLUDED.label;",
+                                (study_id, vg, label.strip() or None))
+                    banner = f'<div class="result">{_esc(vg)} linked.</div>'
+            elif action == "unlink":
+                cur.execute("DELETE FROM vagis_study_members WHERE study_id = %s AND person_code = %s;",
+                            (study_id, code))
+                banner = f'<div class="result">{_esc(code)} unlinked.</div>'
+            elif action == "addresearcher":
+                cur.execute("INSERT INTO vagis_study_access (key, study_id, researcher, email) "
+                            "VALUES (%s, %s, %s, %s);",
+                            (secrets.token_urlsafe(24), study_id, label.strip() or None,
+                             email.strip() or None))
+                banner = '<div class="result">Researcher added. Their addresses are below.</div>'
+            elif action == "revoke":
+                cur.execute("UPDATE vagis_study_access SET revoked = TRUE WHERE key = %s;", (key,))
+                banner = '<div class="result">Access removed. Those addresses no longer work.</div>'
+    finally:
+        conn.close()
+    return _studies_page(request, token, banner)
