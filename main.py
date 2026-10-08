@@ -2751,6 +2751,11 @@ def _studies_html(request: Request, token: str) -> str:
     <div style="flex:1;min-width:140px"><label>Logo (optional)</label><input name="logo" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div>
     <button name="action" value="save" class="secondary" style="margin:0">Save</button>
   </form>
+  <form method="post" action="/admin/ui/study/delete" style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <input type="hidden" name="token" value="{tok}"><input type="hidden" name="study_id" value="{sid}">
+    <label style="margin:0"><input type="checkbox" name="confirm" value="yes" style="width:auto"> Yes, delete this study</label>
+    <button class="small secondary" style="background:#a32d2d">Delete study</button>
+  </form>
 </div>""")
     return "".join(blocks) or '<p class="sub" style="margin-top:12px">No studies yet.</p>'
 
@@ -2824,3 +2829,32 @@ async def admin_study_update(request: Request, token: str = Form(""), study_id: 
     finally:
         conn.close()
     return _studies_page(request, token, '<div class="result">Study saved.</div>')
+
+
+@app.post("/admin/ui/study/delete", response_class=HTMLResponse)
+def admin_study_delete(request: Request, token: str = Form(""), study_id: int = Form(0),
+                       confirm: str = Form("")) -> HTMLResponse:
+    """Deletes the study, its subject list, researcher list and links. The
+    subjects' own codes and data are not touched."""
+    if not _admin_ok(token):
+        return HTMLResponse(_admin_page(token, '<div class="err">Admin token did not match.</div>'))
+    if confirm != "yes":
+        return _studies_page(request, token,
+                             '<div class="err">Tick &ldquo;Yes, delete this study&rdquo; first.</div>')
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
+            cur.execute("SELECT name FROM vagis_studies WHERE id = %s;", (study_id,))
+            r = cur.fetchone()
+            if not r:
+                return _studies_page(request, token, '<div class="err">That study no longer exists.</div>')
+            for t in ("vagis_study_members", "vagis_study_researchers", "vagis_study_access"):
+                cur.execute(f"DELETE FROM {t} WHERE study_id = %s;", (study_id,))
+            cur.execute("DELETE FROM ai_notes WHERE person_code = %s;", (f"STUDY-{study_id}",))
+            cur.execute("DELETE FROM vagis_studies WHERE id = %s;", (study_id,))
+    finally:
+        conn.close()
+    return _studies_page(request, token,
+                         f'<div class="result">Study &ldquo;{_esc(r[0])}&rdquo; deleted. Its page and '
+                         'connector no longer work. Subjects keep their codes and data.</div>')
