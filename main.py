@@ -15,7 +15,7 @@ Endpoints:
   POST /chat                   -- old in-app agent relay (no longer used by the app)
   GET  /admin                  -- add people, set tiers, connector addresses, studies
   POST /mcp/study/{key}        -- a researcher's study connector (all subjects in the study)
-  GET  /study/{key}            -- a researcher's download page
+  GET  /study/{key}            -- Vagis Researcher page for a study (one shared link)
   GET  /study/{key}/download   -- zip of the study's data
 """
 
@@ -798,15 +798,21 @@ def _admin_page(token: str = "", banner: str = "", people_html: str = "",
   </div>
   <div class="card">
     <h2>Studies</h2>
-    <p class="sub">A study groups Vagis codes. Each researcher gets a study connector address
-    (shows everyone in the study in Claude/ChatGPT) and a download page.</p>
-    <form method="post" action="/admin/ui/study/add">
+    <p class="sub">Make a study for a research group. They get their own Vagis Researcher page
+    (add subjects, add researchers, Claude connector, download).</p>
+    <form method="post" action="/admin/ui/study/add" enctype="multipart/form-data">
       <label>Admin token</label>
       <input name="token" type="password" placeholder="Your VAGIS_ADMIN_TOKEN" value="{tok}" autocomplete="off">
-      <label>New study name</label>
-      <input name="name" type="text" placeholder="Jason research">
-      <button type="submit">Add study</button>
-      <button type="submit" formaction="/admin/ui/studies" class="secondary">Show studies</button>
+      <label>Study name</label>
+      <input name="name" type="text" placeholder="Renegade">
+      <label>Lead researcher name</label>
+      <input name="lead_name" type="text" placeholder="Tess">
+      <label>Lead researcher email</label>
+      <input name="lead_email" type="text" placeholder="tess@example.com">
+      <label>Logo (optional, PNG/JPEG, under 1 MB)</label>
+      <input name="logo" type="file" accept="image/png,image/jpeg,image/webp,image/gif">
+      <button type="submit">Make study</button>
+      <button type="submit" formaction="/admin/ui/studies" formenctype="application/x-www-form-urlencoded" class="secondary">Show studies</button>
     </form>
     {studies_html}
   </div>
@@ -1918,6 +1924,14 @@ def admin_person_add(request: Request, token: str = Form(""), name: str = Form("
     try:
         with conn, conn.cursor() as cur:
             _ai_ensure_tables(cur)
+            have = _person_by_email(cur, email)
+            if have:
+                person = vg_person(cur, have)
+                key = _vg_active_key(cur, have) or _ai_issue_key(cur, have)
+                url = f"{_base_url(request)}/mcp/{key}"
+                return HTMLResponse(_admin_page(token, _vg_result(
+                    person, url, '<div class="warn">This email already has a Vagis code. '
+                    'No new code was made; this is their existing one.</div>')))
             code = make_vg_code()
             while vg_person(cur, code):
                 code = make_vg_code()
@@ -2056,9 +2070,41 @@ CREATE TABLE IF NOT EXISTS vagis_study_access (
 """
 
 
+STUDY_MIGRATE_SQL = """
+ALTER TABLE vagis_studies ADD COLUMN IF NOT EXISTS key        TEXT;
+ALTER TABLE vagis_studies ADD COLUMN IF NOT EXISTS lead_name  TEXT;
+ALTER TABLE vagis_studies ADD COLUMN IF NOT EXISTS lead_email TEXT;
+ALTER TABLE vagis_studies ADD COLUMN IF NOT EXISTS logo       BYTEA;
+ALTER TABLE vagis_studies ADD COLUMN IF NOT EXISTS logo_type  TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS vagis_studies_key ON vagis_studies (key);
+CREATE TABLE IF NOT EXISTS vagis_study_researchers (
+    id           SERIAL PRIMARY KEY,
+    study_id     INTEGER NOT NULL,
+    name         TEXT,
+    email        TEXT,
+    added_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+
 def _study_ensure(cur) -> None:
     _ai_ensure_tables(cur)
     cur.execute(CREATE_STUDIES_SQL)
+    cur.execute(STUDY_MIGRATE_SQL)
+    # One link per study. A study made before this keeps its first researcher
+    # key as the study link (so connectors already added keep working) and its
+    # researchers move to the contact list.
+    cur.execute("SELECT id FROM vagis_studies WHERE key IS NULL;")
+    for (sid,) in cur.fetchall():
+        cur.execute("SELECT key FROM vagis_study_access WHERE study_id = %s AND NOT revoked "
+                    "ORDER BY created_at LIMIT 1;", (sid,))
+        r = cur.fetchone()
+        cur.execute("UPDATE vagis_studies SET key = %s WHERE id = %s;",
+                    (r[0] if r else secrets.token_urlsafe(24), sid))
+        cur.execute("INSERT INTO vagis_study_researchers (study_id, name, email) "
+                    "SELECT study_id, researcher, email FROM vagis_study_access "
+                    "WHERE study_id = %s AND NOT revoked ORDER BY created_at;", (sid,))
+        cur.execute("UPDATE vagis_study_access SET revoked = TRUE WHERE study_id = %s;", (sid,))
 
 
 def _study_for_key(key: str) -> Optional[dict[str, Any]]:
@@ -2068,13 +2114,34 @@ def _study_for_key(key: str) -> Optional[dict[str, Any]]:
     try:
         with conn, conn.cursor() as cur:
             _study_ensure(cur)
-            cur.execute("SELECT s.id, s.name, a.researcher FROM vagis_study_access a "
-                        "JOIN vagis_studies s ON s.id = a.study_id "
-                        "WHERE a.key = %s AND NOT a.revoked;", (key,))
+            cur.execute("SELECT id, name, lead_name, lead_email, logo IS NOT NULL "
+                        "FROM vagis_studies WHERE key = %s;", (key,))
             r = cur.fetchone()
-            return {"id": r[0], "name": r[1], "researcher": r[2]} if r else None
+            return ({"id": r[0], "name": r[1], "researcher": r[2], "lead_email": r[3],
+                     "has_logo": r[4], "key": key} if r else None)
     finally:
         conn.close()
+
+
+def _person_by_email(cur, email: str) -> Optional[str]:
+    """Code already issued to this email (case and spaces ignored), or None."""
+    e = (email or "").strip().lower()
+    if not e:
+        return None
+    cur.execute("SELECT code FROM vagis_people WHERE lower(trim(email)) = %s "
+                "ORDER BY created_at LIMIT 1;", (e,))
+    r = cur.fetchone()
+    return r[0] if r else None
+
+
+def _new_person(cur, name: str, email: str, tier: str = "free") -> str:
+    code = make_vg_code()
+    while vg_person(cur, code):
+        code = make_vg_code()
+    cur.execute("INSERT INTO vagis_people (code, name, email, tier) VALUES (%s, %s, %s, %s);",
+                (code, name.strip() or None, email.strip() or None, tier))
+    _ai_issue_key(cur, code)
+    return code
 
 
 def _study_members(cur, study_id: int) -> list[tuple[str, str]]:
@@ -2391,16 +2458,69 @@ def study_download(key: str):
                              f'attachment; filename="vagis_{fname}_{stamp}.zip"'})
 
 
-@app.get("/study/{key}", response_class=HTMLResponse)
-def study_page(key: str) -> HTMLResponse:
-    study = _study_for_key(key)
-    if not study:
-        return HTMLResponse("<p>Unknown or retired study link.</p>", status_code=404)
+
+
+# ---- Logo ------------------------------------------------------------------
+LOGO_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+LOGO_MAX_BYTES = 1024 * 1024
+
+
+@app.get("/study/{key}/logo")
+def study_logo(key: str):
+    if not DATABASE_URL:
+        return Response(status_code=404)
     conn = db_connect()
     try:
         with conn, conn.cursor() as cur:
             _study_ensure(cur)
-            rows = []
+            cur.execute("SELECT logo, logo_type FROM vagis_studies WHERE key = %s;", (key,))
+            r = cur.fetchone()
+    finally:
+        conn.close()
+    if not r or not r[0]:
+        return Response(status_code=404)
+    return Response(bytes(r[0]), media_type=r[1] or "image/png",
+                    headers={"Cache-Control": "no-cache"})
+
+
+# ---- Vagis Researcher page (one link per study, shared by its researchers) --
+def _subject_email(name: str, email: str, code: str, study: str, existing: bool) -> str:
+    lines = [f"Hi {name}," if name else "Hi,", ""]
+    if existing:
+        lines += [f"You have been added to the research study \"{study}\".", "",
+                  f"Keep using your Vagis code {code}. If sharing is already on in the "
+                  "Vagis app (Analysis > Data Share), there is nothing to do."]
+    else:
+        lines += [f"Your Vagis code for the research study \"{study}\": {code}", "",
+                  "Enter it in the Vagis app: Analysis > Data Share > type the code > "
+                  "Check > Start sharing.",
+                  "After that your data is sent automatically after each recording."]
+    return _mailto(email, f"Vagis study: {study}", "\n".join(lines), "Email subject")
+
+
+def _researcher_email(name: str, email: str, study: str, page: str, mcp: str) -> str:
+    body = "\n".join([
+        f"Hi {name}," if name else "Hi,", "",
+        f"Your access to the Vagis research study \"{study}\".", "",
+        "1. Study page (add subjects and researchers, download all data):", page, "",
+        "2. Claude connector address:", mcp, "",
+        "In Claude: Customize > Connectors > + > Add custom connector, name it "
+        f"\"Vagis {study}\" and paste the connector address. Then in a chat ask, for "
+        "example, \"list the subjects in my Vagis study\".", "",
+        "Keep both addresses private: anyone with them can see the study's data."])
+    return _mailto(email, f"Vagis study: {study}", body, "Email")
+
+
+def _study_page_html(request: Request, study: dict, banner: str = "") -> str:
+    base = _base_url(request)
+    key = study["key"]
+    page, mcp = f"{base}/study/{key}", f"{base}/mcp/study/{key}"
+    act = f"/study/{_esc(key)}/do"
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
+            subj_rows = []
             for code, disp in _study_members(cur, study["id"]):
                 cur.execute("SELECT mode, row_count, uploaded_at FROM research_uploads "
                             "WHERE person_code = %s AND mode <> %s ORDER BY mode;",
@@ -2408,30 +2528,194 @@ def study_page(key: str) -> HTMLResponse:
                 ups = cur.fetchall()
                 last = max((u[2] for u in ups if u[2]), default=None)
                 modes = ", ".join(f"{m} ({n})" for m, n, _ in ups) or "no data yet"
-                rows.append(f"<tr><td><b>{_esc(disp)}</b><br><span class='muted'>{_esc(code)}</span></td>"
-                            f"<td style='white-space:normal'>{_esc(modes)}</td>"
-                            f"<td>{last.strftime('%Y-%m-%d') if last else '&mdash;'}</td></tr>")
+                subj_rows.append(
+                    f"<tr><td><b>{_esc(disp)}</b><br><span class='muted mono'>{_esc(code)}</span></td>"
+                    f"<td style='white-space:normal'>{_esc(modes)}</td>"
+                    f"<td>{last.strftime('%Y-%m-%d') if last else '&mdash;'}</td>"
+                    f"<td><form class='inline' method='post' action='{act}'>"
+                    f"<input type='hidden' name='code' value='{_esc(code)}'>"
+                    f"<button class='small secondary' name='action' value='unlink'>Unlink</button>"
+                    f"</form></td></tr>")
+            cur.execute("SELECT id, name, email FROM vagis_study_researchers "
+                        "WHERE study_id = %s ORDER BY added_at;", (study["id"],))
+            researchers = cur.fetchall()
     finally:
         conn.close()
-    table = ("<div class='tablewrap'><table><tr><th>Subject</th><th>Recordings</th><th>Last sent</th></tr>"
-             + "".join(rows) + "</table></div>") if rows else "<p class='sub'>No subjects linked yet.</p>"
-    return HTMLResponse(f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+    subjects = (("<div class='tablewrap'><table><tr><th>Subject</th><th>Recordings</th>"
+                 "<th>Last sent</th><th></th></tr>" + "".join(subj_rows) + "</table></div>")
+                if subj_rows else "<p class='sub'>No subjects yet.</p>")
+    res_rows = "".join(
+        f"<div class='subrow'><span><b>{_esc(n or '')}</b> <span class='muted'>{_esc(e or '')}</span></span>"
+        f"<span>{_researcher_email(n or '', e or '', study['name'], page, mcp) if e else ''} "
+        f"<form class='inline' method='post' action='{act}'>"
+        f"<input type='hidden' name='rid' value='{rid}'>"
+        f"<button class='small secondary' name='action' value='rremove'>Remove</button></form></span></div>"
+        for rid, n, e in researchers) or "<p class='sub'>No researchers listed yet.</p>"
+    logo = (f"<img src='/study/{_esc(key)}/logo' alt='' style='max-height:64px;max-width:240px;"
+            f"display:block;margin-bottom:14px'>" if study.get("has_logo") else "")
+    return f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Vagis study</title>{_style()}</head><body>
+<title>{_esc(study['name'])} · Vagis Researcher</title>{_style()}</head><body>
+  {logo}
   <h1>{_esc(study['name'])}</h1>
-  <p class="sub">Vagis study data{(' &middot; ' + _esc(study['researcher'])) if study['researcher'] else ''}</p>
+  <p class="sub">Vagis Researcher page. Keep this page's address private: anyone with it can see the study's data.</p>
+  {banner}
   <div class="card">
-    <h2>Download</h2>
-    <p class="sub">One zip: a Session History CSV per mode with every subject (subject column first),
-    plus each recording's graph data in graph_data/&lt;subject&gt;/.</p>
+    <h2>Subjects</h2>
+    {subjects}
+    <h2 style="margin-top:22px">Add subject</h2>
+    <p class="sub">Makes a Vagis code linked to this study. If the email already has a Vagis code, that code is added to the study instead.</p>
+    <form method="post" action="{act}" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+      <div style="flex:1;min-width:160px"><label>Name</label><input name="name" placeholder="Dana or S01"></div>
+      <div style="flex:1;min-width:160px"><label>Email</label><input name="email" placeholder="name@example.com"></div>
+      <button name="action" value="add" style="margin:0">Add subject</button>
+    </form>
+    <h2 style="margin-top:22px">Add someone who already has a Vagis code</h2>
+    <form method="post" action="{act}" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+      <div style="flex:1;min-width:160px"><label>Vagis code</label><input name="code" placeholder="VG-XXXX-XXXX"></div>
+      <div style="flex:1;min-width:160px"><label>Name in study</label><input name="name" placeholder="Dana or S01"></div>
+      <button name="action" value="link" style="margin:0">Add to study</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2>Use the data</h2>
+    <label>Claude connector address</label>
+    <div class="mono" style="font-size:13px;word-break:break-all;padding:10px 12px;background:#f4f4f4;border-radius:8px">{_esc(mcp)}</div>
+    <p class="sub" style="margin-top:8px">In Claude: Customize &gt; Connectors &gt; + &gt; Add custom connector, name it
+    &ldquo;Vagis {_esc(study['name'])}&rdquo; and paste the address.</p>
     <a href="/study/{_esc(key)}/download" style="display:inline-block;padding:10px 18px;background:#0f6e56;
        color:#fff;border-radius:8px;text-decoration:none;font-weight:500">Download all data (.zip)</a>
+    <p class="sub" style="margin-top:8px">One spreadsheet (CSV) per mode with every subject, plus each recording's graph data.</p>
   </div>
-  <div class="card"><h2>Subjects</h2>{table}</div>
-</body></html>""")
+  <div class="card">
+    <h2>Researchers</h2>
+    <p class="sub">Everyone on the study uses this same page and connector. Email sends a person both addresses.</p>
+    {res_rows}
+    <form method="post" action="{act}" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+      <div style="flex:1;min-width:160px"><label>Name</label><input name="name" placeholder="Name"></div>
+      <div style="flex:1;min-width:160px"><label>Email</label><input name="email" placeholder="name@example.com"></div>
+      <button name="action" value="radd" style="margin:0">Add researcher</button>
+    </form>
+  </div>
+  <div class="card">
+    <h2>New link</h2>
+    <p class="sub">Use this when someone should no longer have access. This page's address and the Claude
+    connector address both change; the old ones stop working for everyone. Then use Email above to send the
+    new ones to the researchers who stay, and each of them replaces the connector address in Claude.</p>
+    <form method="post" action="{act}">
+      <label><input type="checkbox" name="confirm" value="yes" style="width:auto"> Yes, make a new link</label>
+      <button name="action" value="newlink" class="secondary">Make new link</button>
+    </form>
+  </div>
+</body></html>"""
 
 
-# ---- Admin: studies --------------------------------------------------------
+@app.get("/study/{key}", response_class=HTMLResponse)
+def study_page(request: Request, key: str) -> HTMLResponse:
+    study = _study_for_key(key)
+    if not study:
+        return HTMLResponse("<p>Unknown or retired study link.</p>", status_code=404)
+    banner = ('<div class="result">New link made. The old page and connector addresses no longer '
+              'work. Email the researchers below their new addresses.</div>'
+              if request.query_params.get("new") else "")
+    return HTMLResponse(_study_page_html(request, study, banner))
+
+
+@app.post("/study/{key}/do", response_class=HTMLResponse)
+def study_do(request: Request, key: str, action: str = Form(""), name: str = Form(""),
+             email: str = Form(""), code: str = Form(""), rid: int = Form(0),
+             confirm: str = Form("")):
+    from fastapi.responses import RedirectResponse
+    study = _study_for_key(key)
+    if not study:
+        return HTMLResponse("<p>Unknown or retired study link.</p>", status_code=404)
+    sid, sname = study["id"], study["name"]
+    name, email = name.strip(), email.strip()
+    banner = ""
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
+
+            def link(c: str, label: str) -> bool:
+                cur.execute("SELECT 1 FROM vagis_study_members WHERE study_id = %s AND person_code = %s;",
+                            (sid, c))
+                if cur.fetchone():
+                    return False
+                cur.execute("INSERT INTO vagis_study_members (study_id, person_code, label) "
+                            "VALUES (%s, %s, %s);", (sid, c, label or None))
+                return True
+
+            if action == "add":
+                if not name or "@" not in email:
+                    banner = '<div class="err">Give the subject a name and an email.</div>'
+                else:
+                    have = _person_by_email(cur, email)
+                    if have:
+                        added = link(have, name)
+                        msg = ("This email already has a Vagis code. It has been added to the study; "
+                               "no new code was made." if added else
+                               "This email's Vagis code is already in the study. Nothing changed.")
+                        banner = (f'<div class="result"><b>{_esc(name)}</b> &middot; <span class="mono">{_esc(have)}</span>'
+                                  f'<br>{msg}<br>{_subject_email(name, email, have, sname, True) if added else ""}</div>')
+                    else:
+                        new = _new_person(cur, name, email)
+                        link(new, name)
+                        banner = (f'<div class="result"><b>{_esc(name)}</b> &middot; Vagis code '
+                                  f'<span class="mono">{_esc(new)}</span><br>Added to the study. Send the '
+                                  f'code to the subject:<br>{_subject_email(name, email, new, sname, False)}</div>')
+            elif action == "link":
+                vg = parse_vg_code(code)
+                if not vg or not vg_person(cur, vg):
+                    banner = '<div class="err">That is not a Vagis code. Check it and try again.</div>'
+                elif link(vg, name):
+                    banner = f'<div class="result">{_esc(name or vg)} ({_esc(vg)}) added to the study.</div>'
+                else:
+                    banner = f'<div class="err">{_esc(vg)} is already in the study. Nothing changed.</div>'
+            elif action == "unlink":
+                cur.execute("DELETE FROM vagis_study_members WHERE study_id = %s AND person_code = %s;",
+                            (sid, code))
+                banner = (f'<div class="result">{_esc(code)} removed from the study. Their own data '
+                          'and code are not affected.</div>')
+            elif action == "radd":
+                if not email:
+                    banner = '<div class="err">Give the researcher an email.</div>'
+                else:
+                    cur.execute("INSERT INTO vagis_study_researchers (study_id, name, email) "
+                                "VALUES (%s, %s, %s);", (sid, name or None, email))
+                    banner = f'<div class="result">{_esc(name or email)} added. Use Email to send them the addresses.</div>'
+            elif action == "rremove":
+                cur.execute("DELETE FROM vagis_study_researchers WHERE id = %s AND study_id = %s;",
+                            (rid, sid))
+                banner = ('<div class="result">Removed from the list. They can still use the page until '
+                          'you make a new link.</div>')
+            elif action == "newlink":
+                if confirm != "yes":
+                    banner = '<div class="err">Tick &ldquo;Yes, make a new link&rdquo; first.</div>'
+                else:
+                    new_key = secrets.token_urlsafe(24)
+                    cur.execute("UPDATE vagis_studies SET key = %s WHERE id = %s;", (new_key, sid))
+                    return RedirectResponse(f"/study/{new_key}?new=1", status_code=303)
+    finally:
+        conn.close()
+    return HTMLResponse(_study_page_html(request, study, banner))
+
+
+# ---- Admin: studies (Vagis only) -------------------------------------------
+async def _read_logo(logo: Optional[UploadFile]) -> tuple[Optional[bytes], Optional[str], str]:
+    """(bytes, type, error). No file -> (None, None, "")."""
+    if logo is None or not logo.filename:
+        return None, None, ""
+    data = await logo.read()
+    if not data:
+        return None, None, ""
+    if logo.content_type not in LOGO_TYPES:
+        return None, None, "Logo must be a PNG, JPEG, WebP or GIF image."
+    if len(data) > LOGO_MAX_BYTES:
+        return None, None, "Logo must be under 1 MB."
+    return data, logo.content_type, ""
+
+
 def _studies_html(request: Request, token: str) -> str:
     base = _base_url(request)
     tok = _esc(token)
@@ -2439,71 +2723,35 @@ def _studies_html(request: Request, token: str) -> str:
     try:
         with conn, conn.cursor() as cur:
             _study_ensure(cur)
-            cur.execute("SELECT id, name FROM vagis_studies ORDER BY created_at DESC;")
+            cur.execute("SELECT s.id, s.name, s.key, s.lead_name, s.lead_email, s.logo IS NOT NULL, "
+                        "(SELECT COUNT(*) FROM vagis_study_members m WHERE m.study_id = s.id) "
+                        "FROM vagis_studies s ORDER BY s.created_at DESC;")
             studies = cur.fetchall()
-            blocks = []
-            for sid, sname in studies:
-                members = _study_members(cur, sid)
-                cur.execute("SELECT code, name FROM vagis_people;")
-                names = dict(cur.fetchall())
-                cur.execute("SELECT key, researcher, email FROM vagis_study_access "
-                            "WHERE study_id = %s AND NOT revoked ORDER BY created_at;", (sid,))
-                access = cur.fetchall()
-                hidden = (f'<input type="hidden" name="token" value="{tok}">'
-                          f'<input type="hidden" name="study_id" value="{sid}">')
-                mem_rows = "".join(
-                    f'<div class="subrow"><span><b>{_esc(disp)}</b> '
-                    f'<span class="muted mono">{_esc(code) if disp != code else ""}</span>'
-                    f'<span class="muted"> &middot; in People as {_esc(names.get(code) or "(no name)")}</span></span>'
-                    f'<form class="inline" method="post" action="/admin/ui/study/update">{hidden}'
-                    f'<input type="hidden" name="code" value="{_esc(code)}">'
-                    f'<button class="small secondary" name="action" value="unlink">Unlink</button></form></div>'
-                    for code, disp in members) or '<p class="muted">No codes linked yet.</p>'
-                acc_rows = ""
-                for key, who, email in access:
-                    mcp = f"{base}/mcp/study/{key}"
-                    page = f"{base}/study/{key}"
-                    body = "\n".join([
-                        f"Hi {who}," if who else "Hi,", "",
-                        f"Your Vagis study connection for \"{sname}\".", "",
-                        "1. Study connector address (keep it private, like a password):", mcp, "",
-                        "In Claude: Customize > Connectors > + > Add custom connector, name it "
-                        f"\"Vagis {sname}\" and paste the address. In a chat, ask e.g. "
-                        "\"list the subjects in my Vagis study\".", "",
-                        "2. Download page (all data as CSV files in a zip):", page, "", "Jason"])
-                    mail = _mailto(email or "", f"Vagis study: {sname}", body, "Email researcher") if email else ""
-                    acc_rows += (f'<div style="padding:10px 0;border-bottom:1px solid #f0f0f0">'
-                                 f'<b>{_esc(who or "Researcher")}</b> <span class="muted">{_esc(email or "")}</span>'
-                                 f'<div class="mono" style="font-size:12px;word-break:break-all;margin-top:6px">'
-                                 f'Connector: {_esc(mcp)}<br>Download page: {_esc(page)}</div>'
-                                 f'<form class="inline" method="post" action="/admin/ui/study/update">{hidden}'
-                                 f'<input type="hidden" name="key" value="{_esc(key)}">'
-                                 f'<button class="small secondary" name="action" value="revoke" '
-                                 f'style="margin-top:8px">Remove access</button></form> {mail}</div>')
-                if not acc_rows:
-                    acc_rows = '<p class="muted">No researchers yet.</p>'
-                blocks.append(f"""
-<div style="border:1px solid #e4e4e4;border-radius:10px;padding:16px;margin-top:16px">
-  <h2 style="margin-bottom:6px">{_esc(sname)} <span class="pill">{len(members)} subject(s)</span></h2>
-  <h2 style="font-size:14px;margin:14px 0 4px">Subjects</h2>
-  {mem_rows}
-  <form method="post" action="/admin/ui/study/update" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
-    {hidden}
-    <div style="flex:1;min-width:150px"><label>Vagis code</label><input name="code" placeholder="VG-XXXX-XXXX"></div>
-    <div style="flex:1;min-width:150px"><label>Name in study (optional)</label><input name="label" placeholder="Dana or S01"></div>
-    <button name="action" value="link" style="margin:0">Link code</button>
-  </form>
-  <h2 style="font-size:14px;margin:18px 0 4px">Researchers</h2>
-  {acc_rows}
-  <form method="post" action="/admin/ui/study/update" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
-    {hidden}
-    <div style="flex:1;min-width:150px"><label>Researcher name</label><input name="label" placeholder="Jason"></div>
-    <div style="flex:1;min-width:150px"><label>Email</label><input name="email" placeholder="name@example.com"></div>
-    <button name="action" value="addresearcher" style="margin:0">Add researcher</button>
-  </form>
-</div>""")
     finally:
         conn.close()
+    blocks = []
+    for sid, sname, key, lead, lead_email, has_logo, n in studies:
+        page, mcp = f"{base}/study/{key}", f"{base}/mcp/study/{key}"
+        mail = _researcher_email(lead or "", lead_email, sname, page, mcp).replace(
+            ">Email<", ">Email lead researcher<") if lead_email else ""
+        logo = (f"<img src='/study/{_esc(key)}/logo' alt='' style='max-height:40px;max-width:160px;"
+                f"display:block;margin-bottom:8px'>" if has_logo else "")
+        blocks.append(f"""
+<div style="border:1px solid #e4e4e4;border-radius:10px;padding:16px;margin-top:16px">
+  {logo}
+  <h2 style="margin-bottom:4px">{_esc(sname)} <span class="pill">{n} subject(s)</span></h2>
+  <p class="sub" style="margin:0 0 8px">Lead: {_esc(lead or '—')} {_esc(lead_email or '')}</p>
+  <div class="mono" style="font-size:12px;word-break:break-all">Researcher page: <a href="{_esc(page)}">{_esc(page)}</a><br>Connector: {_esc(mcp)}</div>
+  {mail}
+  <form method="post" action="/admin/ui/study/update" enctype="multipart/form-data"
+        style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-top:12px">
+    <input type="hidden" name="token" value="{tok}"><input type="hidden" name="study_id" value="{sid}">
+    <div style="flex:1;min-width:140px"><label>Lead researcher name</label><input name="lead_name" value="{_esc(lead or '')}"></div>
+    <div style="flex:1;min-width:140px"><label>Lead researcher email</label><input name="lead_email" value="{_esc(lead_email or '')}"></div>
+    <div style="flex:1;min-width:140px"><label>Logo (optional)</label><input name="logo" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></div>
+    <button name="action" value="save" class="secondary" style="margin:0">Save</button>
+  </form>
+</div>""")
     return "".join(blocks) or '<p class="sub" style="margin-top:12px">No studies yet.</p>'
 
 
@@ -2512,72 +2760,67 @@ def _studies_page(request: Request, token: str, banner: str = "") -> HTMLRespons
 
 
 @app.post("/admin/ui/studies", response_class=HTMLResponse)
-def admin_studies(request: Request, token: str = Form(""), name: str = Form("")) -> HTMLResponse:
+def admin_studies(request: Request, token: str = Form("")) -> HTMLResponse:
     if not _admin_ok(token):
         return HTMLResponse(_admin_page(token, '<div class="err">Admin token did not match.</div>'))
     return _studies_page(request, token)
 
 
 @app.post("/admin/ui/study/add", response_class=HTMLResponse)
-def admin_study_add(request: Request, token: str = Form(""), name: str = Form("")) -> HTMLResponse:
+async def admin_study_add(request: Request, token: str = Form(""), name: str = Form(""),
+                          lead_name: str = Form(""), lead_email: str = Form(""),
+                          logo: Optional[UploadFile] = File(None)) -> HTMLResponse:
     if not _admin_ok(token):
         return HTMLResponse(_admin_page(token, '<div class="err">Admin token did not match.</div>'))
     name = name.strip()
     if not name:
         return _studies_page(request, token, '<div class="err">Give the study a name.</div>')
+    data, ctype, err = await _read_logo(logo)
+    if err:
+        return _studies_page(request, token, f'<div class="err">{err}</div>')
     conn = db_connect()
     try:
         with conn, conn.cursor() as cur:
             _study_ensure(cur)
-            cur.execute("INSERT INTO vagis_studies (name) VALUES (%s);", (name,))
+            cur.execute("INSERT INTO vagis_studies (name, key, lead_name, lead_email, logo, logo_type) "
+                        "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id;",
+                        (name, secrets.token_urlsafe(24), lead_name.strip() or None,
+                         lead_email.strip() or None, data, ctype))
+            sid = cur.fetchone()[0]
+            if lead_email.strip():
+                cur.execute("INSERT INTO vagis_study_researchers (study_id, name, email) "
+                            "VALUES (%s, %s, %s);", (sid, lead_name.strip() or None, lead_email.strip()))
     finally:
         conn.close()
     return _studies_page(request, token,
-                         f'<div class="result">Study &ldquo;{_esc(name)}&rdquo; added. '
-                         'Link codes and add researchers below.</div>')
+                         f'<div class="result">Study &ldquo;{_esc(name)}&rdquo; made. Use '
+                         '&ldquo;Email lead researcher&rdquo; below to send them their page.</div>')
 
 
 @app.post("/admin/ui/study/update", response_class=HTMLResponse)
-def admin_study_update(request: Request, token: str = Form(""), study_id: int = Form(0),
-                       action: str = Form(""), code: str = Form(""), label: str = Form(""),
-                       email: str = Form(""), key: str = Form("")) -> HTMLResponse:
+async def admin_study_update(request: Request, token: str = Form(""), study_id: int = Form(0),
+                             lead_name: str = Form(""), lead_email: str = Form(""),
+                             logo: Optional[UploadFile] = File(None)) -> HTMLResponse:
     if not _admin_ok(token):
         return HTMLResponse(_admin_page(token, '<div class="err">Admin token did not match.</div>'))
-    banner = ""
+    data, ctype, err = await _read_logo(logo)
+    if err:
+        return _studies_page(request, token, f'<div class="err">{err}</div>')
     conn = db_connect()
     try:
         with conn, conn.cursor() as cur:
             _study_ensure(cur)
-            if action == "link":
-                vg = parse_vg_code(code)
-                if not vg or not vg_person(cur, vg):
-                    banner = '<div class="err">That is not a Vagis code on this server.</div>'
-                else:
-                    cur.execute("SELECT label FROM vagis_study_members "
-                                "WHERE study_id = %s AND person_code = %s;", (study_id, vg))
-                    have = cur.fetchone()
-                    if have:
-                        banner = (f'<div class="err">{_esc(vg)} is already in this study'
-                                  f'{" as " + _esc(have[0]) if have[0] else ""}. Nothing changed. '
-                                  'Check you pasted the right code.</div>')
-                    else:
-                        cur.execute("INSERT INTO vagis_study_members (study_id, person_code, label) "
-                                    "VALUES (%s, %s, %s);", (study_id, vg, label.strip() or None))
-                        banner = (f'<div class="result">{_esc(label.strip() or vg)} '
-                                  f'({_esc(vg)}) linked.</div>')
-            elif action == "unlink":
-                cur.execute("DELETE FROM vagis_study_members WHERE study_id = %s AND person_code = %s;",
-                            (study_id, code))
-                banner = f'<div class="result">{_esc(code)} unlinked.</div>'
-            elif action == "addresearcher":
-                cur.execute("INSERT INTO vagis_study_access (key, study_id, researcher, email) "
-                            "VALUES (%s, %s, %s, %s);",
-                            (secrets.token_urlsafe(24), study_id, label.strip() or None,
-                             email.strip() or None))
-                banner = '<div class="result">Researcher added. Their addresses are below.</div>'
-            elif action == "revoke":
-                cur.execute("UPDATE vagis_study_access SET revoked = TRUE WHERE key = %s;", (key,))
-                banner = '<div class="result">Access removed. Those addresses no longer work.</div>'
+            cur.execute("UPDATE vagis_studies SET lead_name = %s, lead_email = %s WHERE id = %s;",
+                        (lead_name.strip() or None, lead_email.strip() or None, study_id))
+            if data:
+                cur.execute("UPDATE vagis_studies SET logo = %s, logo_type = %s WHERE id = %s;",
+                            (data, ctype, study_id))
+            if lead_email.strip():
+                cur.execute("SELECT 1 FROM vagis_study_researchers WHERE study_id = %s "
+                            "AND lower(trim(email)) = %s;", (study_id, lead_email.strip().lower()))
+                if not cur.fetchone():
+                    cur.execute("INSERT INTO vagis_study_researchers (study_id, name, email) "
+                                "VALUES (%s, %s, %s);", (study_id, lead_name.strip() or None, lead_email.strip()))
     finally:
         conn.close()
-    return _studies_page(request, token, banner)
+    return _studies_page(request, token, '<div class="result">Study saved.</div>')
