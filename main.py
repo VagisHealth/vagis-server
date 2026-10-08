@@ -1324,9 +1324,18 @@ GRAPH_STYLES: dict[str, str] = {
         "REM, Light, Deep, with a filled bar in a stage's lane for every stretch spent in "
         "it (thin connectors between lanes are optional). Colours: Awake #FFFFFF, REM "
         "#5AA6EE, Light #3554C9, Deep #4FDBFF. Beside each lane label you may show that "
-        "stage's percentage of the night."),
+        "stage's percentage of the night. Under the lanes the app draws a motion strip: "
+        "take it from the same night's sleep/heart_rate graph data (motion column)."),
     "sleep/heart_rate": (
-        "Overnight heart rate. Columns: time, hr (bpm). Line #3B82F6, y-axis in bpm."),
+        "Overnight heart rate. Columns: time, hr (bpm), motion, beats_pct; one row per "
+        "30 s. Line #3B82F6, y-axis in bpm. Under it draw a thin motion strip: one bar "
+        "per row, height = motion (the largest movement score in that 30 s; under 2 is "
+        "still, 2-10 some movement, 10 or more large movement), colour #8E8E93. "
+        "beats_pct is signal quality: how much of the 30 s was covered by detected "
+        "beats (100 = every beat found). Lower values mean beats were missed there, so "
+        "treat hr in those rows with caution; when the user asks about data quality, "
+        "use it and motion together. motion and beats_pct are blank for nights whose "
+        "beat file is no longer on the phone."),
     "sleep/cycling": (
         "Pulse Wave Cycling. Columns: time (start of each 5-min bin), pwa_hr, pwa, vaso "
         "(counts in that bin). Draw THREE LANES, not overlaid curves, top to bottom: "
@@ -2435,6 +2444,8 @@ def _studies_html(request: Request, token: str) -> str:
             blocks = []
             for sid, sname in studies:
                 members = _study_members(cur, sid)
+                cur.execute("SELECT code, name FROM vagis_people;")
+                names = dict(cur.fetchall())
                 cur.execute("SELECT key, researcher, email FROM vagis_study_access "
                             "WHERE study_id = %s AND NOT revoked ORDER BY created_at;", (sid,))
                 access = cur.fetchall()
@@ -2442,7 +2453,8 @@ def _studies_html(request: Request, token: str) -> str:
                           f'<input type="hidden" name="study_id" value="{sid}">')
                 mem_rows = "".join(
                     f'<div class="subrow"><span><b>{_esc(disp)}</b> '
-                    f'<span class="muted mono">{_esc(code) if disp != code else ""}</span></span>'
+                    f'<span class="muted mono">{_esc(code) if disp != code else ""}</span>'
+                    f'<span class="muted"> &middot; in People as {_esc(names.get(code) or "(no name)")}</span></span>'
                     f'<form class="inline" method="post" action="/admin/ui/study/update">{hidden}'
                     f'<input type="hidden" name="code" value="{_esc(code)}">'
                     f'<button class="small secondary" name="action" value="unlink">Unlink</button></form></div>'
@@ -2541,11 +2553,18 @@ def admin_study_update(request: Request, token: str = Form(""), study_id: int = 
                 if not vg or not vg_person(cur, vg):
                     banner = '<div class="err">That is not a Vagis code on this server.</div>'
                 else:
-                    cur.execute("INSERT INTO vagis_study_members (study_id, person_code, label) "
-                                "VALUES (%s, %s, %s) ON CONFLICT (study_id, person_code) "
-                                "DO UPDATE SET label = EXCLUDED.label;",
-                                (study_id, vg, label.strip() or None))
-                    banner = f'<div class="result">{_esc(vg)} linked.</div>'
+                    cur.execute("SELECT label FROM vagis_study_members "
+                                "WHERE study_id = %s AND person_code = %s;", (study_id, vg))
+                    have = cur.fetchone()
+                    if have:
+                        banner = (f'<div class="err">{_esc(vg)} is already in this study'
+                                  f'{" as " + _esc(have[0]) if have[0] else ""}. Nothing changed. '
+                                  'Check you pasted the right code.</div>')
+                    else:
+                        cur.execute("INSERT INTO vagis_study_members (study_id, person_code, label) "
+                                    "VALUES (%s, %s, %s);", (study_id, vg, label.strip() or None))
+                        banner = (f'<div class="result">{_esc(label.strip() or vg)} '
+                                  f'({_esc(vg)}) linked.</div>')
             elif action == "unlink":
                 cur.execute("DELETE FROM vagis_study_members WHERE study_id = %s AND person_code = %s;",
                             (study_id, code))
