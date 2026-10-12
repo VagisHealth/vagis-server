@@ -17,6 +17,9 @@ Endpoints:
   POST /mcp/study/{key}        -- a researcher's study connector (all subjects in the study)
   GET  /study/{key}            -- Vagis Researcher page for a study (one shared link)
   GET  /study/{key}/download   -- zip of the study's data
+  POST /ingest/raw/status      -- app asks: is this code in a study? which raw recordings are here?
+  POST /ingest/raw             -- app sends one finished recording's raw CSVs (zip) — study subjects only
+  GET  /study/{key}/raw.zip    -- zip of the raw files a study connector link asks for
 """
 
 from __future__ import annotations
@@ -214,6 +217,10 @@ def init_db() -> None:
         conn = db_connect()
         with conn, conn.cursor() as cur:
             _study_ensure(cur)
+        conn.close()
+        conn = db_connect()
+        with conn, conn.cursor() as cur:
+            _raw_ensure(cur)
         conn.close()
     except Exception as e:
         print(f"[startup] db init failed: {type(e).__name__}: {e}")
@@ -859,8 +866,8 @@ def admin_page() -> HTMLResponse:
 #   get_saved_variants   genomic variants the user saved in the app's Genomics
 #   save_note / get_notes  short notes carried between conversations
 #
-# Only Session History metrics (what the app uploads via Data Share) are ever
-# served. No raw signal exists on the server.
+# Only Session History metrics and graph data are served here. Raw signal is
+# kept only for study subjects and reachable only through study connectors.
 #
 # ADAPTS TO APP CHANGES. Session History is served exactly as uploaded, with
 # whatever columns it has, and any mode name the app sends is listed. New or
@@ -2001,9 +2008,13 @@ def _people_table(request: Request, token: str) -> str:
     </form>
   </td>
 </tr>""")
+    try:
+        usage = f'<p class="sub" style="margin-top:10px">{_esc(_raw_usage())}</p>'
+    except Exception as e:
+        usage = f'<p class="sub">Raw data size unavailable ({type(e).__name__}).</p>'
     return ('<div class="tablewrap" style="margin-top:12px"><table>'
             '<tr><th>Code</th><th>Email / data</th><th>Tier</th><th></th></tr>'
-            + "".join(rows) + "</table></div>")
+            + "".join(rows) + "</table></div>" + usage)
 
 
 @app.post("/admin/ui/people", response_class=HTMLResponse)
@@ -2229,14 +2240,19 @@ def _st_list_subjects(study: dict, args: dict) -> str:
                 gr = cur.fetchall()
                 lines.append(f"\n## {_subject_id(m)}")
                 if not ups and not gr:
-                    lines.append("No data yet (sharing not started in the app).")
-                    continue
+                    lines.append("No metric data yet (sharing not started in the app).")
                 for mode, n, up in ups:
                     lines.append(f"- {mode}: {n} recording(s), last sent "
                                  f"{up.strftime('%Y-%m-%d %H:%M UTC') if up else '?'}")
                 if gr:
                     lines.append("  graph data: " + "; ".join(
                         f"{mo}/{g} {n} ({lo[:10]} to {hi[:10]})" for mo, g, n, lo, hi in gr))
+                _raw_ensure(cur)
+                cur.execute("SELECT mode, COUNT(DISTINCT stamp) FROM vagis_raw_files "
+                            "WHERE person_code = %s GROUP BY mode ORDER BY mode;", (code,))
+                rw = cur.fetchall()
+                if rw:
+                    lines.append("  raw recordings: " + "; ".join(f"{mo} {n}" for mo, n in rw))
     finally:
         conn.close()
     return "\n".join(lines)
@@ -2361,6 +2377,738 @@ STUDY_TOOLS: dict[str, dict[str, Any]] = {
                   "description": "Notes saved from earlier conversations about this study, newest first."},
 }
 
+
+# ==========================================================================
+# RAW RECORDINGS — study subjects only
+# ==========================================================================
+# For a person whose code is linked to at least one study, the app zips each
+# finished recording's raw CSVs (sleep: PPG, PPI, accel ...) and sends the zip
+# to POST /ingest/raw. The server unpacks it and keeps every CSV as its own
+# file (gzip-compressed), labelled subject / mode / recording start / kind.
+#
+# Researchers reach raw data ONLY through a study connector (Claude/ChatGPT):
+#   list_raw_recordings     what each subject has
+#   get_raw_download_link   one zip of exactly the files asked for (any
+#                           subjects, mode, dates, file kinds) — the zip is
+#                           built when the link is opened, split into parts
+#                           so each stays under a chat's upload limit
+#   get_raw_segment         a few minutes of one file, read in the chat
+# Personal (Premium) connectors never see raw data.
+#
+# STORAGE. Every byte goes through _blob_put / _blob_get / _blob_delete. For
+# now they keep files in the Postgres database (table vagis_blobs). Moving to
+# large file storage later means rewriting only those three functions and
+# copying the existing blobs across; nothing else changes.
+import gzip as _gzip
+import json
+import tempfile as _tempfile
+
+RAW_MAX_UPLOAD_BYTES = int(os.environ.get("VAGIS_RAW_MAX_MB", "200")) * 1024 * 1024
+RAW_PART_MAX_BYTES = int(os.environ.get("VAGIS_RAW_PART_MB", "450")) * 1024 * 1024
+RAW_SEGMENT_DEFAULT_ROWS = 1500
+RAW_SEGMENT_MAX_ROWS = 4000
+PUBLIC_BASE_URL = os.environ.get("VAGIS_PUBLIC_URL", "https://vagis-server.onrender.com").rstrip("/")
+
+CREATE_RAW_SQL = """
+CREATE TABLE IF NOT EXISTS vagis_blobs (
+    path         TEXT PRIMARY KEY,
+    data         BYTEA NOT NULL,
+    bytes        BIGINT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS vagis_raw_files (
+    id           SERIAL PRIMARY KEY,
+    person_code  TEXT NOT NULL,
+    mode         TEXT NOT NULL,
+    stamp        TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    filename     TEXT NOT NULL,
+    blob_path    TEXT NOT NULL,
+    csv_bytes    BIGINT NOT NULL,
+    stored_bytes BIGINT NOT NULL,
+    rows         INTEGER NOT NULL,
+    columns      TEXT NOT NULL,
+    first_ts     TEXT,
+    last_ts      TEXT,
+    uploaded_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (person_code, mode, stamp, filename)
+);
+CREATE INDEX IF NOT EXISTS vagis_raw_files_person ON vagis_raw_files (person_code, mode, stamp);
+"""
+_RAW_READY = False
+
+
+def _raw_ensure(cur) -> None:
+    global _RAW_READY
+    if _RAW_READY:
+        return
+    cur.execute(CREATE_RAW_SQL)
+    _RAW_READY = True
+
+
+# ---- Storage (the only part that changes when storage moves) --------------
+def _blob_put(cur, path: str, data: bytes) -> None:
+    cur.execute("""INSERT INTO vagis_blobs (path, data, bytes) VALUES (%s, %s, %s)
+                   ON CONFLICT (path) DO UPDATE SET data = EXCLUDED.data,
+                   bytes = EXCLUDED.bytes, created_at = now();""",
+                (path, psycopg2.Binary(data), len(data)))
+
+
+def _blob_get(cur, path: str) -> Optional[bytes]:
+    cur.execute("SELECT data FROM vagis_blobs WHERE path = %s;", (path,))
+    r = cur.fetchone()
+    return bytes(r[0]) if r else None
+
+
+def _blob_delete(cur, path: str) -> None:
+    cur.execute("DELETE FROM vagis_blobs WHERE path = %s;", (path,))
+
+
+def _raw_usage() -> str:
+    """One line for /admin: how much raw data is stored."""
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _raw_ensure(cur)
+            cur.execute("SELECT COUNT(*), COALESCE(SUM(stored_bytes), 0), "
+                        "COUNT(DISTINCT (person_code, mode, stamp)) FROM vagis_raw_files;")
+            n, stored, recs = cur.fetchone()
+            cur.execute("SELECT pg_database_size(current_database());")
+            db = cur.fetchone()[0]
+    finally:
+        conn.close()
+    return (f"Raw data: {recs} recording(s), {n} file(s), {_gb(stored)} stored. "
+            f"Whole database: {_gb(db)}.")
+
+
+def _gb(n: int) -> str:
+    return f"{n / 1073741824:.2f} GB" if n >= 107374182 else f"{n / 1048576:.1f} MB"
+
+
+# ---- Names ----------------------------------------------------------------
+# App file names: <kind>_<mode token>_<yyyyMMdd_HHmmss>.csv, e.g.
+# ppg_raw_sleep_20261011_231200.csv, accel_quickcheck_..., ppi_green_stand_...
+# Exertion is exertion_<stamp>.csv (stored heart rate only).
+RAW_MODE_TOKENS = {"sleep": "sleep", "stand": "stand", "load": "load",
+                   "breathwork": "breathwork", "quickcheck": "quick_check"}
+RAW_MODES = ("sleep", "stand", "load", "breathwork", "quick_check", "exertion")
+
+
+def _raw_kind(filename: str, mode: str, stamp: str) -> str:
+    base = filename[:-4] if filename.lower().endswith(".csv") else filename
+    if mode == "exertion" and base == f"exertion_{stamp}":
+        return "hr"
+    tok = next((t for t, m in RAW_MODE_TOKENS.items() if m == mode), mode)
+    suffix = f"_{tok}_{stamp}"
+    if base.endswith(suffix):
+        return base[: -len(suffix)] or "file"
+    return base.replace(f"_{stamp}", "") or "file"
+
+
+def _kind_matches(kind: str, wanted: list[str]) -> bool:
+    """'ppg' matches ppg_raw / ppg_raw_green; 'ppi' matches ppi / ppi_green ..."""
+    if not wanted:
+        return True
+    k = kind.lower()
+    return any(k == w or k.startswith(w) for w in wanted)
+
+
+def _norm_kinds(v: Any) -> list[str]:
+    if isinstance(v, str):
+        v = [v]
+    if not isinstance(v, list):
+        return []
+    out = []
+    for x in v:
+        s = str(x).strip().lower().replace(" ", "_")
+        if s in ("all", "*", ""):
+            return []
+        out.append(s)
+    return out
+
+
+_RAW_TIME_COLS = ("iso_ts", "timestamp", "time")
+
+
+def _csv_meta(data: bytes) -> dict[str, Any]:
+    """rows, columns, first and last time value of one CSV."""
+    text = io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace", newline="")
+    header = text.readline().strip().lstrip("﻿")
+    cols = [c.strip() for c in header.split(",")]
+    ti = next((cols.index(c) for c in _RAW_TIME_COLS if c in cols), None)
+    first = last = None
+    n = 0
+    for line in text:
+        if not line.strip():
+            continue
+        n += 1
+        if first is None:
+            first = line
+        last = line
+
+    def tval(ln: Optional[str]) -> Optional[str]:
+        if ln is None or ti is None:
+            return None
+        p = ln.rstrip("\r\n").split(",")
+        return p[ti] if ti < len(p) else None
+    return {"rows": n, "columns": cols, "first": tval(first), "last": tval(last)}
+
+
+def _stamp_label(stamp: str) -> str:
+    try:
+        return datetime.strptime(stamp, "%Y%m%d_%H%M%S").strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return stamp
+
+
+def _in_any_study(cur, code: str) -> bool:
+    _study_ensure(cur)
+    cur.execute("SELECT 1 FROM vagis_study_members WHERE person_code = %s LIMIT 1;", (code,))
+    return cur.fetchone() is not None
+
+
+# ---- App endpoints ---------------------------------------------------------
+class RawStatusRequest(BaseModel):
+    enrollment_code: str
+
+
+@app.post("/ingest/raw/status")
+def ingest_raw_status(req: RawStatusRequest,
+                      authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """App asks: is this code in a study (so raw recordings should be sent),
+    and which recordings does the server already have ("mode|stamp")."""
+    check_app_auth(authorization)
+    code = parse_vg_code(req.enrollment_code)
+    if not code:
+        return {"in_study": False, "have": []}
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            _raw_ensure(cur)
+            if not vg_person(cur, code) or not _in_any_study(cur, code):
+                return {"in_study": False, "have": []}
+            cur.execute("SELECT DISTINCT mode, stamp FROM vagis_raw_files WHERE person_code = %s;",
+                        (code,))
+            have = [f"{m}|{s}" for m, s in cur.fetchall()]
+    finally:
+        conn.close()
+    return {"in_study": True, "have": have}
+
+
+def _raw_store(code: str, mode: str, stamp: str, zpath: str) -> dict[str, Any]:
+    try:
+        z = _zipfile.ZipFile(zpath)
+    except _zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Upload is not a valid zip.")
+    members = [i for i in z.infolist()
+               if not i.is_dir() and "__MACOSX" not in i.filename
+               and i.filename.rsplit("/", 1)[-1].lower().endswith(".csv")
+               and not i.filename.rsplit("/", 1)[-1].startswith(".")]
+    if not members:
+        raise HTTPException(status_code=400, detail="The zip holds no CSV files.")
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            ensure_tables(cur)
+            _raw_ensure(cur)
+            if not vg_person(cur, code):
+                raise HTTPException(status_code=404, detail="That Vagis code isn't recognized.")
+            if not _in_any_study(cur, code):
+                raise HTTPException(status_code=403, detail="This code is not in a study.")
+        # One transaction per file keeps each database statement small.
+        kept = []
+        total = 0
+        for info in members:
+            fname = info.filename.rsplit("/", 1)[-1]
+            data = z.read(info)
+            meta = _csv_meta(data)
+            gz = _gzip.compress(data, compresslevel=6)
+            del data
+            path = f"raw/{code}/{mode}/{stamp}/{fname}.gz"
+            with conn, conn.cursor() as cur:
+                cur.execute("SET LOCAL statement_timeout = 180000;")
+                _blob_put(cur, path, gz)
+                cur.execute("""
+                    INSERT INTO vagis_raw_files (person_code, mode, stamp, kind, filename, blob_path,
+                        csv_bytes, stored_bytes, rows, columns, first_ts, last_ts)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (person_code, mode, stamp, filename) DO UPDATE SET
+                        kind = EXCLUDED.kind, blob_path = EXCLUDED.blob_path,
+                        csv_bytes = EXCLUDED.csv_bytes, stored_bytes = EXCLUDED.stored_bytes,
+                        rows = EXCLUDED.rows, columns = EXCLUDED.columns,
+                        first_ts = EXCLUDED.first_ts, last_ts = EXCLUDED.last_ts,
+                        uploaded_at = now();""",
+                            (code, mode, stamp, _raw_kind(fname, mode, stamp), fname, path,
+                             info.file_size, len(gz), meta["rows"], ",".join(meta["columns"]),
+                             meta["first"], meta["last"]))
+            kept.append(fname)
+            total += len(gz)
+        # A re-sent recording replaces the old one: drop files no longer in it.
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT filename, blob_path FROM vagis_raw_files WHERE person_code = %s "
+                        "AND mode = %s AND stamp = %s;", (code, mode, stamp))
+            for fname, path in cur.fetchall():
+                if fname not in kept:
+                    _blob_delete(cur, path)
+                    cur.execute("DELETE FROM vagis_raw_files WHERE person_code = %s AND mode = %s "
+                                "AND stamp = %s AND filename = %s;", (code, mode, stamp, fname))
+    finally:
+        conn.close()
+        z.close()
+    return {"status": "ok", "mode": mode, "stamp": stamp, "files": kept, "stored_bytes": total}
+
+
+@app.post("/ingest/raw")
+async def ingest_raw(request: Request) -> dict[str, Any]:
+    """One finished recording's raw CSVs as a zip (the request body). Headers:
+    X-Vagis-Code, X-Vagis-Mode (sleep, stand, load, breathwork, quick_check,
+    exertion), X-Vagis-Stamp (yyyyMMdd_HHmmss, the recording's file stamp).
+    Sending the same recording again replaces it."""
+    check_app_auth(request.headers.get("authorization"))
+    code = parse_vg_code(request.headers.get("x-vagis-code") or "")
+    mode = (request.headers.get("x-vagis-mode") or "").strip().lower()
+    stamp = (request.headers.get("x-vagis-stamp") or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="Raw upload needs a Vagis (VG) code.")
+    if mode not in RAW_MODES:
+        raise HTTPException(status_code=400, detail="Unknown mode.")
+    if len(stamp) != 15 or stamp[8] != "_" or not (stamp[:8] + stamp[9:]).isdigit():
+        raise HTTPException(status_code=400, detail="Bad stamp (yyyyMMdd_HHmmss).")
+    tmp = _tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    size = 0
+    try:
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > RAW_MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="Recording zip too large.")
+            tmp.write(chunk)
+        tmp.close()
+        if size == 0:
+            raise HTTPException(status_code=400, detail="Empty upload.")
+        return await asyncio.to_thread(_raw_store, code, mode, stamp, tmp.name)
+    finally:
+        try:
+            tmp.close()
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+# ---- Selecting files -------------------------------------------------------
+def _date8(v: Any) -> Optional[str]:
+    """'2026-10-05' / '20261005' -> '20261005'."""
+    s = "".join(ch for ch in str(v or "") if ch.isdigit())
+    return s[:8] if len(s) >= 8 else None
+
+
+def _raw_select(cur, study: dict, subjects: list[str], mode: str, date_from: Optional[str],
+                date_to: Optional[str], kinds: list[str],
+                stamp_from: Optional[str] = None, stamp_to: Optional[str] = None
+                ) -> tuple[list[tuple], list[str]]:
+    """Files of this study's subjects matching the filters, ordered by subject,
+    recording, file. Returns (rows, unknown subjects). Row:
+    (person_code, display, mode, stamp, kind, filename, blob_path, csv_bytes,
+     stored_bytes, rows, first_ts, last_ts)."""
+    members = _study_members(cur, study["id"])
+    disp = dict(members)
+    unknown = []
+    if subjects:
+        codes = []
+        for s in subjects:
+            c = _study_find(cur, study["id"], s)
+            if c:
+                codes.append(c)
+            else:
+                unknown.append(s)
+    else:
+        codes = [c for c, _ in members]
+    if not codes:
+        return [], unknown
+    q = ("SELECT person_code, mode, stamp, kind, filename, blob_path, csv_bytes, stored_bytes, "
+         "rows, first_ts, last_ts FROM vagis_raw_files WHERE person_code = ANY(%s)")
+    p: list[Any] = [codes]
+    if mode:
+        q += " AND mode = %s"
+        p.append(mode)
+    if date_from:
+        q += " AND substr(stamp, 1, 8) >= %s"
+        p.append(date_from)
+    if date_to:
+        q += " AND substr(stamp, 1, 8) <= %s"
+        p.append(date_to)
+    if stamp_from:
+        q += " AND stamp >= %s"
+        p.append(stamp_from)
+    if stamp_to:
+        q += " AND stamp <= %s"
+        p.append(stamp_to)
+    cur.execute(q + " ORDER BY person_code, mode, stamp, filename;", p)
+    order = {c: i for i, (c, _) in enumerate(members)}
+    rows = [(r[0], disp.get(r[0], r[0])) + tuple(r[1:]) for r in cur.fetchall()
+            if _kind_matches(r[3], kinds)]
+    rows.sort(key=lambda r: (order.get(r[0], 0), r[2], r[3], r[5]))
+    return rows, unknown
+
+
+def _safe(s: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in s).strip("_") or "x"
+
+
+# ---- Connector tools ---------------------------------------------------------
+def _st_list_raw(study: dict, args: dict) -> str:
+    subj = (args.get("subject") or "").strip()
+    mode = (args.get("mode") or "").strip().lower()
+    df, dt = _date8(args.get("from_date")), _date8(args.get("to_date"))
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
+            _raw_ensure(cur)
+            rows, unknown = _raw_select(cur, study, [subj] if subj else [], mode, df, dt, [])
+            if unknown:
+                return "That subject is not in this study. Call list_subjects."
+            members = _study_members(cur, study["id"])
+    finally:
+        conn.close()
+    head = f"Raw recordings in study {study['name']}"
+    if not rows:
+        return head + ": none match."
+    if not subj:
+        # Summary per subject — studies can have hundreds of subjects.
+        by: dict[str, dict] = {}
+        for r in rows:
+            d = by.setdefault(r[0], {"recs": {}, "bytes": 0})
+            key = (r[2], r[3])
+            d["recs"].setdefault(key, set()).add(r[4])
+            d["bytes"] += r[8]
+        lines = [head + " (summary; give a subject for each recording's files)."]
+        for code, name in members:
+            if code not in by:
+                continue
+            d = by[code]
+            modes: dict[str, list[str]] = {}
+            for (m, s) in d["recs"]:
+                modes.setdefault(m, []).append(s)
+            parts = [f"{m} {len(v)} ({_stamp_label(min(v))[:10]} to {_stamp_label(max(v))[:10]})"
+                     for m, v in sorted(modes.items())]
+            kinds = sorted({k for ks in d["recs"].values() for k in ks})
+            lines.append(f"- {_subject_id((code, name))}: " + "; ".join(parts)
+                         + f"; file kinds {', '.join(kinds)}; {_gb(d['bytes'])}")
+        return "\n".join(lines)
+    lines = [head + f", {_subject_id((rows[0][0], rows[0][1]))}:"]
+    cur_rec = None
+    for r in rows:
+        rec = (r[2], r[3])
+        if rec != cur_rec:
+            cur_rec = rec
+            lines.append(f"- recording {r[2]}_{r[3]}: {r[2]}, started {_stamp_label(r[3])} "
+                         "(phone's local time)")
+        span = f", {str(r[10])[:19]} to {str(r[11])[:19]}" if r[10] and r[11] else ""
+        lines.append(f"    {r[5]} (kind {r[4]}): {r[9]:,} rows{span}, {_gb(r[7])} as CSV")
+    return "\n".join(lines)
+
+
+def _st_raw_link(study: dict, args: dict) -> str:
+    subjects = args.get("subjects") or []
+    if isinstance(subjects, str):
+        subjects = [subjects]
+    subjects = [str(s).strip() for s in subjects if str(s).strip()]
+    mode = (args.get("mode") or "").strip().lower()
+    df, dt = _date8(args.get("from_date")), _date8(args.get("to_date"))
+    kinds = _norm_kinds(args.get("files"))
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
+            _raw_ensure(cur)
+            rows, unknown = _raw_select(cur, study, subjects, mode, df, dt, kinds)
+    finally:
+        conn.close()
+    if unknown:
+        return "Not in this study: " + ", ".join(unknown) + ". Call list_subjects."
+    if not rows:
+        return "No raw files match. Call list_raw_recordings to see what exists."
+    # Split into parts (whole recordings per subject) so each zip stays under
+    # a chat's upload limit.
+    parts: list[list[tuple]] = []
+    cur_part: list[tuple] = []
+    size = 0
+    i = 0
+    while i < len(rows):
+        j = i
+        rec_bytes = 0
+        while j < len(rows) and rows[j][:4] == rows[i][:4]:
+            rec_bytes += rows[j][8]
+            j += 1
+        if cur_part and size + rec_bytes > RAW_PART_MAX_BYTES:
+            parts.append(cur_part)
+            cur_part, size = [], 0
+        cur_part.extend(rows[i:j])
+        size += rec_bytes
+        i = j
+    if cur_part:
+        parts.append(cur_part)
+    base = f"{PUBLIC_BASE_URL}/study/{study['key']}/raw.zip"
+    links = []
+    for part in parts:
+        codes = sorted({r[0] for r in part}, key=lambda c: [r[0] for r in part].index(c))
+        q = [("subjects", ",".join(codes))]
+        if mode:
+            q.append(("mode", mode))
+        if kinds:
+            q.append(("files", ",".join(kinds)))
+        q.append(("from", min(r[3] for r in part)))
+        q.append(("to", max(r[3] for r in part)))
+        url = base + "?" + "&".join(f"{k}={_q(v)}" for k, v in q)
+        recs = len({r[:4] for r in part})
+        links.append(f"- {url}\n  {recs} recording(s), {len(part)} file(s), about "
+                     f"{_gb(sum(r[8] for r in part))}; subjects "
+                     + ", ".join(sorted({r[1] for r in part})))
+    what = ", ".join(kinds) if kinds else "all files"
+    return (f"{len(links)} download link(s) for {what}"
+            f"{' (' + mode + ')' if mode else ''}. Each zip holds one folder per subject, "
+            "then the original CSV names (the recording start is in each name). The zip is "
+            "built when the link is opened, so a large one can take a minute to start. "
+            "Give these links to the user to download and add to the chat (up to 20 files "
+            "per chat, 500 MB each); if your workspace can reach this server, you may "
+            "download them directly.\n" + "\n".join(links))
+
+
+_SEG_CACHE: dict[str, Any] = {"path": None, "data": None}
+
+
+def _parse_ts(v: str) -> Optional[datetime]:
+    v = (v or "").strip().strip('"')
+    if not v:
+        return None
+    if v.endswith("Z"):
+        v = v[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(v)
+    except ValueError:
+        try:
+            return datetime.fromisoformat(v[:19])
+        except ValueError:
+            return None
+
+
+def _seg_target(start: str, first: datetime) -> Optional[datetime]:
+    """HH:MM[:SS] on the file's own clock (next time on/after its first row),
+    or a full date-time."""
+    s = start.strip()
+    if len(s) <= 8 and ":" in s:
+        try:
+            p = [int(x) for x in s.split(":")]
+            t = first.replace(hour=p[0], minute=p[1], second=p[2] if len(p) > 2 else 0,
+                              microsecond=0)
+        except (ValueError, IndexError):
+            return None
+        if t < first.replace(microsecond=0):
+            t += timedelta(days=1)
+        return t
+    t = _parse_ts(s)
+    if t is None:
+        return None
+    if t.tzinfo is None and first.tzinfo is not None:
+        t = t.replace(tzinfo=first.tzinfo)
+    elif t.tzinfo is not None and first.tzinfo is None:
+        t = t.replace(tzinfo=None)
+    return t
+
+
+def _st_raw_segment(study: dict, args: dict) -> str:
+    rec = (args.get("recording") or "").strip()
+    want = (args.get("file") or "").strip().lower()
+    start = (args.get("start") or "").strip()
+    mr = args.get("max_rows")
+    max_rows = (min(int(mr), RAW_SEGMENT_MAX_ROWS) if isinstance(mr, (int, float)) and mr > 0
+                else RAW_SEGMENT_DEFAULT_ROWS)
+    ev = args.get("every")
+    every = max(1, int(ev)) if isinstance(ev, (int, float)) and ev >= 1 else 1
+    if len(rec) < 17 or rec[-16] != "_":
+        return "Give recording as list_raw_recordings shows it, e.g. sleep_20261011_231200."
+    mode, stamp = rec[:-16], rec[-15:]
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
+            _raw_ensure(cur)
+            code = _study_find(cur, study["id"], args.get("subject") or "")
+            if not code:
+                return "That subject is not in this study. Call list_subjects."
+            cur.execute("SELECT filename, kind, blob_path FROM vagis_raw_files WHERE "
+                        "person_code = %s AND mode = %s AND stamp = %s ORDER BY filename;",
+                        (code, mode, stamp))
+            files = cur.fetchall()
+            if not files:
+                return "No such raw recording for that subject. Call list_raw_recordings."
+            pick = (next((f for f in files if f[0].lower() == want), None)
+                    or next((f for f in files if want and f[0].lower().startswith(want)), None)
+                    or next((f for f in files if want and f[1].lower().startswith(want)), None))
+            if not pick:
+                return ("Give `file` as one of: " + ", ".join(f[0] for f in files)
+                        + " (or its kind: " + ", ".join(sorted({f[1] for f in files})) + ").")
+            if _SEG_CACHE["path"] != pick[2]:
+                gz = _blob_get(cur, pick[2])
+                _SEG_CACHE.update(path=pick[2], data=_gzip.decompress(gz) if gz else None)
+            data = _SEG_CACHE["data"]
+    finally:
+        conn.close()
+    if data is None:
+        return "That file is missing from storage."
+    text = io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace", newline="")
+    header = text.readline().rstrip("\r\n").lstrip("﻿")
+    cols = [c.strip() for c in header.split(",")]
+    ti = next((cols.index(c) for c in _RAW_TIME_COLS if c in cols), None)
+    out = io.StringIO()
+    out.write(header + "\n")
+    taken = k = 0
+    target = None
+    started = not start or ti is None
+    more = False
+    for line in text:
+        if not line.strip():
+            continue
+        if not started:
+            p = line.split(",")
+            t = _parse_ts(p[ti]) if ti < len(p) else None
+            if t is None:
+                continue
+            if target is None:
+                target = _seg_target(start, t)
+                if target is None:
+                    return "Give start as HH:MM, HH:MM:SS or a full date-time."
+            try:
+                if t < target:
+                    continue
+            except TypeError:
+                return "Couldn't compare times in this file; omit start."
+            started = True
+        if k % every == 0:
+            if taken >= max_rows:
+                more = True
+                break
+            out.write(line if line.endswith("\n") else line + "\n")
+            taken += 1
+        k += 1
+    if taken == 0:
+        return "No rows at or after that start in this file."
+    tips = ""
+    if pick[1].startswith("ppg") or pick[1].startswith("accel"):
+        tips = (" Samples in one BLE packet share one time value (sample_idx / "
+                "sample_in_packet counts within the packet): space samples evenly at the "
+                "~25 Hz rate; never plot them at their packet time.")
+    return (f"{pick[0]}: {taken} row(s){'' if every == 1 else f' (every {every}th)'}"
+            f"{', from ' + start if start else ', from the start'}."
+            f"{' More rows follow: call again with a later start.' if more else ''}{tips}\n\n"
+            + out.getvalue())
+
+
+_DATE_DESC = "Optional, YYYY-MM-DD: recordings that started on or after/before this local date."
+STUDY_TOOLS["list_raw_recordings"] = {
+    "fn": _st_list_raw,
+    "description": ("Raw recordings (raw PPG, accel, PPI, HR ... CSV files) sent by study "
+                    "subjects. Without a subject: a summary per subject. With a subject: "
+                    "every recording and its files (rows, time span, size)."),
+    "schema": {"type": "object", "properties": {
+        "subject": {**_SUBJ, "description": "Optional: one subject (name or Vagis code)."},
+        "mode": {"type": "string", "description": "Optional: sleep, stand, load, breathwork, quick_check or exertion."},
+        "from_date": {"type": "string", "description": _DATE_DESC},
+        "to_date": {"type": "string", "description": _DATE_DESC}},
+        "additionalProperties": False},
+}
+STUDY_TOOLS["get_raw_download_link"] = {
+    "fn": _st_raw_link,
+    "description": ("Download link(s) for a zip of exactly the raw files asked for: any "
+                    "subjects, one mode, a date range, and file kinds (e.g. only ppg, only "
+                    "accel, ppg and ppi, or all). Split into parts so each zip stays under "
+                    "a chat's 500 MB upload limit. Use this for whole-recording or "
+                    "many-night analysis."),
+    "schema": {"type": "object", "properties": {
+        "subjects": {"type": "array", "items": {"type": "string"},
+                     "description": "Optional: names or Vagis codes. Omit for every subject."},
+        "mode": {"type": "string", "description": "Optional: sleep, stand, load, breathwork, quick_check or exertion."},
+        "from_date": {"type": "string", "description": _DATE_DESC},
+        "to_date": {"type": "string", "description": _DATE_DESC},
+        "files": {"type": "array", "items": {"type": "string"},
+                  "description": "Optional file kinds, e.g. [\"ppg\"], [\"accel\"], [\"ppg\",\"ppi\"]. Omit for all."}},
+        "additionalProperties": False},
+}
+STUDY_TOOLS["get_raw_segment"] = {
+    "fn": _st_raw_segment,
+    "description": ("A quick look in the chat: rows from one raw file of one recording, "
+                    "from a clock time, up to 4000 rows per call (about 2.5 min of 25 Hz "
+                    "PPG). For whole recordings use get_raw_download_link."),
+    "schema": {"type": "object", "properties": {
+        "subject": _SUBJ,
+        "recording": {"type": "string", "description": "Recording id from list_raw_recordings, e.g. sleep_20261011_231200."},
+        "file": {"type": "string", "description": "File name or kind (ppg, accel, ppi, hr, events)."},
+        "start": {"type": "string", "description": "Optional: HH:MM or HH:MM:SS on the recording's own clock, or a full date-time."},
+        "max_rows": {"type": "integer", "minimum": 1, "maximum": RAW_SEGMENT_MAX_ROWS},
+        "every": {"type": "integer", "minimum": 1, "description": "Optional: keep every Nth row."}},
+        "required": ["subject", "recording", "file"], "additionalProperties": False},
+}
+
+
+# ---- The download itself -----------------------------------------------------
+def _raw_zip_file(study: dict, subjects: list[str], mode: str, kinds: list[str],
+                  stamp_from: Optional[str], stamp_to: Optional[str]) -> Optional[str]:
+    """Builds the zip in a temp file; returns its path (caller deletes)."""
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            _study_ensure(cur)
+            _raw_ensure(cur)
+            rows, _ = _raw_select(cur, study, subjects, mode, None, None, kinds,
+                                  stamp_from, stamp_to)
+        if not rows:
+            return None
+        tmp = _tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        tmp.close()
+        with _zipfile.ZipFile(tmp.name, "w", _zipfile.ZIP_DEFLATED, compresslevel=1) as z:
+            for r in rows:
+                with conn, conn.cursor() as cur:
+                    gz = _blob_get(cur, r[6])
+                if gz is None:
+                    continue
+                z.writestr(f"{_safe(r[1])}/{r[5]}", _gzip.decompress(gz))
+    finally:
+        conn.close()
+    return tmp.name
+
+
+from fastapi import Query as _Query
+from fastapi.responses import FileResponse as _FileResponse
+from starlette.background import BackgroundTask as _BackgroundTask
+
+
+@app.get("/study/{key}/raw.zip")
+async def study_raw_zip(key: str, subjects: str = "", mode: str = "", files: str = "",
+                        from_: str = _Query("", alias="from"), to: str = ""):
+    """Zip of the raw files a get_raw_download_link link describes."""
+    study = await asyncio.to_thread(_study_for_key, key)
+    if not study:
+        return HTMLResponse("<p>Unknown or retired study link.</p>", status_code=404)
+    subj = [s for s in subjects.split(",") if s.strip()]
+    path = await asyncio.to_thread(_raw_zip_file, study, subj, mode.strip().lower(),
+                                   _norm_kinds(files.split(",")) if files else [],
+                                   from_.strip() or None, to.strip() or None)
+    if not path:
+        return HTMLResponse("<p>No raw files match this link.</p>", status_code=404)
+    name = f"vagis_{_safe(study['name'])}_raw"
+    if mode:
+        name += f"_{_safe(mode)}"
+    if files:
+        name += f"_{_safe(files.replace(',', '-'))}"
+    if from_:
+        name += f"_{from_[:8]}"
+    if to and to[:8] != from_[:8]:
+        name += f"-{to[:8]}"
+    return _FileResponse(path, media_type="application/zip", filename=name + ".zip",
+                         background=_BackgroundTask(os.unlink, path))
+
+
 STUDY_INSTRUCTIONS = (
     "Vagis study connector: Vagis smart-ring metrics for every subject in one research "
     "study. At the start call get_vagis_guide (overview and rules), get_notes and "
@@ -2368,7 +3116,10 @@ STUDY_INSTRUCTIONS = (
     "rules (research use only, no diagnosis, metric names as measured, never describe how "
     "metrics are calculated). 'The user' in the guide means the subject. Use "
     "get_subject_history or get_group_history for the data and get_graph_data to redraw "
-    "the app's graphs."
+    "the app's graphs. Raw recordings (raw PPG, accel, PPI ...): list_raw_recordings to see "
+    "them, get_raw_download_link for zips of exactly the files wanted (whole nights, many "
+    "nights, only PPG, only accel ...), get_raw_segment for a quick look at a few minutes. "
+    "Before any PPG/PWA analysis remove noisy and ectopic beats."
 )
 
 
