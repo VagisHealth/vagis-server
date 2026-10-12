@@ -2654,12 +2654,15 @@ def ingest_raw_status(req: RawStatusRequest,
             _raw_ensure(cur)
             if not vg_person(cur, code) or not _in_any_study(cur, code):
                 return {"in_study": False, "have": []}
-            cur.execute("SELECT DISTINCT mode, stamp FROM vagis_raw_files WHERE person_code = %s;",
-                        (code,))
-            have = [f"{m}|{s}" for m, s in cur.fetchall()]
+            cur.execute("SELECT mode, stamp, COUNT(*) FROM vagis_raw_files WHERE person_code = %s "
+                        "GROUP BY mode, stamp;", (code,))
+            rows = cur.fetchall()
     finally:
         conn.close()
-    return {"in_study": True, "have": have}
+    # have_files: how many files of each recording arrived, so the app can
+    # resend a recording that only partly arrived.
+    return {"in_study": True, "have": [f"{m}|{s}" for m, s, _ in rows],
+            "have_files": {f"{m}|{s}": n for m, s, n in rows}}
 
 
 def _raw_store(code: str, mode: str, stamp: str, zpath: str) -> dict[str, Any]:
