@@ -2395,13 +2395,15 @@ STUDY_TOOLS: dict[str, dict[str, Any]] = {
 #   get_raw_segment         a few minutes of one file, read in the chat
 # Personal (Premium) connectors never see raw data.
 #
-# STORAGE. Every byte goes through _blob_put / _blob_get / _blob_delete. For
-# now they keep files in the Postgres database (table vagis_blobs). Moving to
+# STORAGE. Every byte goes through _blob_put_file / _blob_chunks / _blob_delete.
+# For now they keep files in the Postgres database (table vagis_blob_parts). Moving to
 # large file storage later means rewriting only those three functions and
 # copying the existing blobs across; nothing else changes.
 import gzip as _gzip
 import json
 import tempfile as _tempfile
+import threading
+import zlib as _zlib
 
 RAW_MAX_UPLOAD_BYTES = int(os.environ.get("VAGIS_RAW_MAX_MB", "200")) * 1024 * 1024
 RAW_PART_MAX_BYTES = int(os.environ.get("VAGIS_RAW_PART_MB", "450")) * 1024 * 1024
@@ -2410,11 +2412,11 @@ RAW_SEGMENT_MAX_ROWS = 4000
 PUBLIC_BASE_URL = os.environ.get("VAGIS_PUBLIC_URL", "https://vagis-server.onrender.com").rstrip("/")
 
 CREATE_RAW_SQL = """
-CREATE TABLE IF NOT EXISTS vagis_blobs (
-    path         TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS vagis_blob_parts (
+    path         TEXT NOT NULL,
+    part         INTEGER NOT NULL,
     data         BYTEA NOT NULL,
-    bytes        BIGINT NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    PRIMARY KEY (path, part)
 );
 CREATE TABLE IF NOT EXISTS vagis_raw_files (
     id           SERIAL PRIMARY KEY,
@@ -2447,21 +2449,85 @@ def _raw_ensure(cur) -> None:
 
 
 # ---- Storage (the only part that changes when storage moves) --------------
-def _blob_put(cur, path: str, data: bytes) -> None:
-    cur.execute("""INSERT INTO vagis_blobs (path, data, bytes) VALUES (%s, %s, %s)
-                   ON CONFLICT (path) DO UPDATE SET data = EXCLUDED.data,
-                   bytes = EXCLUDED.bytes, created_at = now();""",
-                (path, psycopg2.Binary(data), len(data)))
+# Files are kept in 4 MB parts and always streamed in and out, so the server
+# never holds a whole file in memory (it has little to spare).
+BLOB_PART_BYTES = 4 * 1024 * 1024
+_RAW_LOCK = threading.Lock()          # one raw upload is processed at a time
+# All raw work (storing uploads, building download zips) runs on ONE worker
+# thread: work spread over many threads leaves memory held by each of them.
+from concurrent.futures import ThreadPoolExecutor as _TPE
+_RAW_POOL = _TPE(max_workers=1, thread_name_prefix="vagis-raw")
 
 
-def _blob_get(cur, path: str) -> Optional[bytes]:
-    cur.execute("SELECT data FROM vagis_blobs WHERE path = %s;", (path,))
-    r = cur.fetchone()
-    return bytes(r[0]) if r else None
+async def _raw_run(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(_RAW_POOL, fn, *args)
+
+
+def _blob_put_file(cur, path: str, fileobj) -> int:
+    """Store a file (read from fileobj) under path, replacing any old copy."""
+    cur.execute("DELETE FROM vagis_blob_parts WHERE path = %s;", (path,))
+    n = part = 0
+    while True:
+        chunk = fileobj.read(BLOB_PART_BYTES)
+        if not chunk:
+            break
+        cur.execute("INSERT INTO vagis_blob_parts (path, part, data) VALUES (%s, %s, %s);",
+                    (path, part, psycopg2.Binary(chunk)))
+        n += len(chunk)
+        part += 1
+        del chunk
+    return n
+
+
+def _blob_chunks(path: str):
+    """Yields the stored file's bytes, one part at a time."""
+    conn = db_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute("SELECT part FROM vagis_blob_parts WHERE path = %s ORDER BY part;", (path,))
+            parts = [r[0] for r in cur.fetchall()]
+        for p in parts:
+            with conn, conn.cursor() as cur:
+                cur.execute("SELECT data FROM vagis_blob_parts WHERE path = %s AND part = %s;",
+                            (path, p))
+                r = cur.fetchone()
+            if r:
+                yield bytes(r[0])
+    finally:
+        conn.close()
 
 
 def _blob_delete(cur, path: str) -> None:
-    cur.execute("DELETE FROM vagis_blobs WHERE path = %s;", (path,))
+    cur.execute("DELETE FROM vagis_blob_parts WHERE path = %s;", (path,))
+
+
+def _gunzip_chunks(chunks):
+    """Decompresses a stream of gzip bytes, chunk by chunk."""
+    d = _zlib.decompressobj(wbits=31)
+    step = 1024 * 1024                  # at most 1 MB of output at a time
+    for c in chunks:
+        data = c
+        while data:
+            out = d.decompress(data, step)
+            if out:
+                yield out
+            data = d.unconsumed_tail
+    tail = d.flush()
+    if tail:
+        yield tail
+
+
+def _iter_lines(chunks):
+    """Text lines (with their newline) from a stream of bytes."""
+    buf = b""
+    for c in chunks:
+        buf += c
+        parts = buf.split(b"\n")
+        buf = parts.pop()
+        for p in parts:
+            yield p.decode("utf-8", "replace") + "\n"
+    if buf:
+        yield buf.decode("utf-8", "replace")
 
 
 def _raw_usage() -> str:
@@ -2530,15 +2596,15 @@ def _norm_kinds(v: Any) -> list[str]:
 _RAW_TIME_COLS = ("iso_ts", "timestamp", "time")
 
 
-def _csv_meta(data: bytes) -> dict[str, Any]:
-    """rows, columns, first and last time value of one CSV."""
-    text = io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace", newline="")
-    header = text.readline().strip().lstrip("﻿")
+def _csv_meta(lines) -> dict[str, Any]:
+    """rows, columns, first and last time value of one CSV (lines streamed)."""
+    it = iter(lines)
+    header = next(it, "").strip().lstrip("\ufeff")
     cols = [c.strip() for c in header.split(",")]
     ti = next((cols.index(c) for c in _RAW_TIME_COLS if c in cols), None)
     first = last = None
     n = 0
-    for line in text:
+    for line in it:
         if not line.strip():
             continue
         n += 1
@@ -2597,6 +2663,22 @@ def ingest_raw_status(req: RawStatusRequest,
 
 
 def _raw_store(code: str, mode: str, stamp: str, zpath: str) -> dict[str, Any]:
+    with _RAW_LOCK:
+        return _raw_store_one(code, mode, stamp, zpath)
+
+
+def _member_chunks(z: "_zipfile.ZipFile", info, gz_out):
+    """Streams one zip member: yields its bytes and writes them gzip-compressed to gz_out."""
+    with z.open(info) as src, _gzip.GzipFile(fileobj=gz_out, mode="wb", compresslevel=6) as g:
+        while True:
+            c = src.read(1024 * 1024)
+            if not c:
+                break
+            g.write(c)
+            yield c
+
+
+def _raw_store_one(code: str, mode: str, stamp: str, zpath: str) -> dict[str, Any]:
     try:
         z = _zipfile.ZipFile(zpath)
     except _zipfile.BadZipFile:
@@ -2606,6 +2688,7 @@ def _raw_store(code: str, mode: str, stamp: str, zpath: str) -> dict[str, Any]:
                and i.filename.rsplit("/", 1)[-1].lower().endswith(".csv")
                and not i.filename.rsplit("/", 1)[-1].startswith(".")]
     if not members:
+        z.close()
         raise HTTPException(status_code=400, detail="The zip holds no CSV files.")
     conn = db_connect()
     try:
@@ -2616,34 +2699,32 @@ def _raw_store(code: str, mode: str, stamp: str, zpath: str) -> dict[str, Any]:
                 raise HTTPException(status_code=404, detail="That Vagis code isn't recognized.")
             if not _in_any_study(cur, code):
                 raise HTTPException(status_code=403, detail="This code is not in a study.")
-        # One transaction per file keeps each database statement small.
         kept = []
         total = 0
         for info in members:
             fname = info.filename.rsplit("/", 1)[-1]
-            data = z.read(info)
-            meta = _csv_meta(data)
-            gz = _gzip.compress(data, compresslevel=6)
-            del data
             path = f"raw/{code}/{mode}/{stamp}/{fname}.gz"
-            with conn, conn.cursor() as cur:
-                cur.execute("SET LOCAL statement_timeout = 180000;")
-                _blob_put(cur, path, gz)
-                cur.execute("""
-                    INSERT INTO vagis_raw_files (person_code, mode, stamp, kind, filename, blob_path,
-                        csv_bytes, stored_bytes, rows, columns, first_ts, last_ts)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (person_code, mode, stamp, filename) DO UPDATE SET
-                        kind = EXCLUDED.kind, blob_path = EXCLUDED.blob_path,
-                        csv_bytes = EXCLUDED.csv_bytes, stored_bytes = EXCLUDED.stored_bytes,
-                        rows = EXCLUDED.rows, columns = EXCLUDED.columns,
-                        first_ts = EXCLUDED.first_ts, last_ts = EXCLUDED.last_ts,
-                        uploaded_at = now();""",
-                            (code, mode, stamp, _raw_kind(fname, mode, stamp), fname, path,
-                             info.file_size, len(gz), meta["rows"], ",".join(meta["columns"]),
-                             meta["first"], meta["last"]))
+            with _tempfile.TemporaryFile() as gz:
+                meta = _csv_meta(_iter_lines(_member_chunks(z, info, gz)))
+                gz.seek(0)
+                with conn, conn.cursor() as cur:
+                    cur.execute("SET LOCAL statement_timeout = 180000;")
+                    stored = _blob_put_file(cur, path, gz)
+                    cur.execute("""
+                        INSERT INTO vagis_raw_files (person_code, mode, stamp, kind, filename,
+                            blob_path, csv_bytes, stored_bytes, rows, columns, first_ts, last_ts)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (person_code, mode, stamp, filename) DO UPDATE SET
+                            kind = EXCLUDED.kind, blob_path = EXCLUDED.blob_path,
+                            csv_bytes = EXCLUDED.csv_bytes, stored_bytes = EXCLUDED.stored_bytes,
+                            rows = EXCLUDED.rows, columns = EXCLUDED.columns,
+                            first_ts = EXCLUDED.first_ts, last_ts = EXCLUDED.last_ts,
+                            uploaded_at = now();""",
+                                (code, mode, stamp, _raw_kind(fname, mode, stamp), fname, path,
+                                 info.file_size, stored, meta["rows"], ",".join(meta["columns"]),
+                                 meta["first"], meta["last"]))
             kept.append(fname)
-            total += len(gz)
+            total += stored
         # A re-sent recording replaces the old one: drop files no longer in it.
         with conn, conn.cursor() as cur:
             cur.execute("SELECT filename, blob_path FROM vagis_raw_files WHERE person_code = %s "
@@ -2686,7 +2767,7 @@ async def ingest_raw(request: Request) -> dict[str, Any]:
         tmp.close()
         if size == 0:
             raise HTTPException(status_code=400, detail="Empty upload.")
-        return await asyncio.to_thread(_raw_store, code, mode, stamp, tmp.name)
+        return await _raw_run(_raw_store, code, mode, stamp, tmp.name)
     finally:
         try:
             tmp.close()
@@ -2875,9 +2956,6 @@ def _st_raw_link(study: dict, args: dict) -> str:
             "download them directly.\n" + "\n".join(links))
 
 
-_SEG_CACHE: dict[str, Any] = {"path": None, "data": None}
-
-
 def _parse_ts(v: str) -> Optional[datetime]:
     v = (v or "").strip().strip('"')
     if not v:
@@ -2949,16 +3027,12 @@ def _st_raw_segment(study: dict, args: dict) -> str:
             if not pick:
                 return ("Give `file` as one of: " + ", ".join(f[0] for f in files)
                         + " (or its kind: " + ", ".join(sorted({f[1] for f in files})) + ").")
-            if _SEG_CACHE["path"] != pick[2]:
-                gz = _blob_get(cur, pick[2])
-                _SEG_CACHE.update(path=pick[2], data=_gzip.decompress(gz) if gz else None)
-            data = _SEG_CACHE["data"]
     finally:
         conn.close()
-    if data is None:
+    text = _iter_lines(_gunzip_chunks(_blob_chunks(pick[2])))
+    header = next(text, "").rstrip("\r\n").lstrip("\ufeff")
+    if not header:
         return "That file is missing from storage."
-    text = io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace", newline="")
-    header = text.readline().rstrip("\r\n").lstrip("﻿")
     cols = [c.strip() for c in header.split(",")]
     ti = next((cols.index(c) for c in _RAW_TIME_COLS if c in cols), None)
     out = io.StringIO()
@@ -3068,11 +3142,14 @@ def _raw_zip_file(study: dict, subjects: list[str], mode: str, kinds: list[str],
         tmp.close()
         with _zipfile.ZipFile(tmp.name, "w", _zipfile.ZIP_DEFLATED, compresslevel=1) as z:
             for r in rows:
-                with conn, conn.cursor() as cur:
-                    gz = _blob_get(cur, r[6])
-                if gz is None:
-                    continue
-                z.writestr(f"{_safe(r[1])}/{r[5]}", _gzip.decompress(gz))
+                zi = _zipfile.ZipInfo(f"{_safe(r[1])}/{r[5]}",
+                                      date_time=datetime.now().timetuple()[:6])
+                zi.compress_type = _zipfile.ZIP_DEFLATED
+                zi.compress_level = 1
+                zi._compresslevel = 1
+                with z.open(zi, "w", force_zip64=True) as out:
+                    for c in _gunzip_chunks(_blob_chunks(r[6])):
+                        out.write(c)
     finally:
         conn.close()
     return tmp.name
@@ -3091,7 +3168,7 @@ async def study_raw_zip(key: str, subjects: str = "", mode: str = "", files: str
     if not study:
         return HTMLResponse("<p>Unknown or retired study link.</p>", status_code=404)
     subj = [s for s in subjects.split(",") if s.strip()]
-    path = await asyncio.to_thread(_raw_zip_file, study, subj, mode.strip().lower(),
+    path = await _raw_run(_raw_zip_file, study, subj, mode.strip().lower(),
                                    _norm_kinds(files.split(",")) if files else [],
                                    from_.strip() or None, to.strip() or None)
     if not path:
