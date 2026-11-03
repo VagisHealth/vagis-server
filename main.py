@@ -2557,13 +2557,20 @@ def _gb(n: int) -> str:
 # Exertion is exertion_<stamp>.csv (stored heart rate only).
 RAW_MODE_TOKENS = {"sleep": "sleep", "stand": "stand", "load": "load",
                    "breathwork": "breathwork", "quickcheck": "quick_check"}
-RAW_MODES = ("sleep", "stand", "load", "breathwork", "quick_check", "exertion")
+RAW_MODES = ("sleep", "stand", "load", "breathwork", "quick_check", "exertion", "research")
 
 
 def _raw_kind(filename: str, mode: str, stamp: str) -> str:
     base = filename[:-4] if filename.lower().endswith(".csv") else filename
     if mode == "exertion" and base == f"exertion_{stamp}":
         return "hr"
+    # Research (Nov 2 2026): <serial>_ppg_raw_research_A_<stamp>,
+    # <serial>_accel_research_B_<stamp>, rr_polar_research_<stamp>,
+    # events_research_<stamp> ... -> 02361_ppg_raw_A, 02361_accel_B,
+    # rr_polar, events (ring serial and A/B kept so the two rings stay apart).
+    if mode == "research":
+        k = base.replace(f"_{stamp}", "").replace("_research", "")
+        return k or "file"
     tok = next((t for t, m in RAW_MODE_TOKENS.items() if m == mode), mode)
     suffix = f"_{tok}_{stamp}"
     if base.endswith(suffix):
@@ -3090,7 +3097,7 @@ STUDY_TOOLS["list_raw_recordings"] = {
                     "every recording and its files (rows, time span, size)."),
     "schema": {"type": "object", "properties": {
         "subject": {**_SUBJ, "description": "Optional: one subject (name or Vagis code)."},
-        "mode": {"type": "string", "description": "Optional: sleep, stand, load, breathwork, quick_check or exertion."},
+        "mode": {"type": "string", "description": "Optional: sleep, stand, load, breathwork, quick_check, exertion or research."},
         "from_date": {"type": "string", "description": _DATE_DESC},
         "to_date": {"type": "string", "description": _DATE_DESC}},
         "additionalProperties": False},
@@ -3105,7 +3112,7 @@ STUDY_TOOLS["get_raw_download_link"] = {
     "schema": {"type": "object", "properties": {
         "subjects": {"type": "array", "items": {"type": "string"},
                      "description": "Optional: names or Vagis codes. Omit for every subject."},
-        "mode": {"type": "string", "description": "Optional: sleep, stand, load, breathwork, quick_check or exertion."},
+        "mode": {"type": "string", "description": "Optional: sleep, stand, load, breathwork, quick_check, exertion or research."},
         "from_date": {"type": "string", "description": _DATE_DESC},
         "to_date": {"type": "string", "description": _DATE_DESC},
         "files": {"type": "array", "items": {"type": "string"},
