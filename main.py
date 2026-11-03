@@ -28,6 +28,7 @@ import asyncio
 import csv
 import io
 import os
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -2560,8 +2561,16 @@ RAW_MODE_TOKENS = {"sleep": "sleep", "stand": "stand", "load": "load",
 RAW_MODES = ("sleep", "stand", "load", "breathwork", "quick_check", "exertion", "research")
 
 
+_RING_PREFIX = re.compile(r"^(2301[A-Za-z0-9-]*|UNKNOWN)_")
+
+
 def _raw_kind(filename: str, mode: str, stamp: str) -> str:
     base = filename[:-4] if filename.lower().endswith(".csv") else filename
+    # Nov 2 2026: the apps put the ring serial in front of each file
+    # (2301B11480_accel_quickcheck_<stamp>.csv). The serial stays in the stored
+    # file name; the kind is taken from the rest, so "accel" still finds it.
+    if mode != "research":
+        base = _RING_PREFIX.sub("", base)
     if mode == "exertion" and base == f"exertion_{stamp}":
         return "hr"
     # Research (Nov 2 2026): <serial>_ppg_raw_research_A_<stamp>,
@@ -2583,7 +2592,11 @@ def _kind_matches(kind: str, wanted: list[str]) -> bool:
     if not wanted:
         return True
     k = kind.lower()
-    return any(k == w or k.startswith(w) for w in wanted)
+    # Research kinds start with the ring serial (11480_ppg_raw_A): also match
+    # on the part after it, so "ppg" or "accel" finds both rings' files.
+    parts = k.split("_", 1)
+    k2 = parts[1] if len(parts) == 2 and any(c.isdigit() for c in parts[0]) else k
+    return any(k == w or k.startswith(w) or k2 == w or k2.startswith(w) for w in wanted)
 
 
 def _norm_kinds(v: Any) -> list[str]:
